@@ -1,5 +1,5 @@
 obj-m += tfe_kmod_core.o
-tfe_kmod_core-y := inet_ntop.o core.o
+tfe_kmod_core-y := src/core.o src/util.o src/proc.o
 
 all:
 	 make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
