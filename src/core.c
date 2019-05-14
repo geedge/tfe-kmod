@@ -13,6 +13,8 @@
 #include <linux/file.h>
 #include <linux/un.h>
 #include <linux/syscalls.h>
+#include <linux/version.h>
+
 
 #ifndef TFE_KMOD_VERSION
 #define TFE_KMOD_VERSION 	"Unknown"
@@ -111,6 +113,10 @@ struct tcp_restore_info_header
 static char * ifname_cmsg = "lo";
 static char * ifname_bfd = "lo";
 static char * scm_socket = "/var/run/.tfe_kmod_scm_socket";
+
+static const char * rm_program_path = "/bin/rm";
+static char * rm_program_envp[] = { "HOME=/", "TERM=linux", "PATH=/usr/bin:/bin", NULL };
+
 static struct tfe_kmod_instance tfe_kmod_instance;
 struct tfe_kmod_instance * g_tfe_kmod_instance = &tfe_kmod_instance;
 
@@ -264,8 +270,6 @@ static int __fd_send_to_tfe_userspace(struct socket * un_sock,
 	iv.iov_len = msglen;
 
 	memset(&msgh, 0, sizeof(msgh));
-	iov_iter_kvec(&msgh.msg_iter, ITER_KVEC | WRITE, &iv, 1, msglen);
-
 	msgh.msg_name = NULL;
 	msgh.msg_namelen = 0;
 	msgh.msg_control = controlMsg.buf;
@@ -288,8 +292,14 @@ static int __fd_send_to_tfe_userspace(struct socket * un_sock,
 	}
 
     /* TODO: replace the sys_* functions with ksys_* when use future kernel version */
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+    ksys_close(fd_client);
+    ksys_close(fd_server);
+#else
     sys_close(fd_client);
     sys_close(fd_server);
+#endif
 
 	return result;
 }
@@ -299,7 +309,7 @@ static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_resto
 {
 	struct socket * __sock;
 	struct file * __file;
-	int __fd;
+	int __fd = 0;
 
 	int result;
 	int sockopt;
@@ -469,6 +479,9 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
 
     struct tfe_kmod_instance * instance;
 
+    /* IP total len */
+    uint16_t * p_ip_total_len;
+
     /* TCP header */
     struct tcphdr _tcp_hdr;
     struct tcphdr * tcp_hdr;
@@ -500,7 +513,6 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
     {
         struct iphdr _ip_hdr;
         struct iphdr * ip_hdr;
-        
         ip_hdr = skb_header_pointer(skb, skb_network_offset(skb), sizeof(_ip_hdr), &_ip_hdr);
 
         /* Not continous at IP header, or not TCP protocol, ignore it */
@@ -508,6 +520,8 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
         {
             goto not_mine;
         }
+
+        p_ip_total_len = &ip_hdr->tot_len;
     }
     else if(skb->protocol == htons(ETH_P_IPV6))
     {
@@ -521,6 +535,8 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
         {
             goto not_mine;
         }
+
+        p_ip_total_len = &ipv6_hdr->payload_len;
     }
     else
     {
@@ -578,7 +594,9 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
         goto errout;
     }
 
-    /* Remove cmsg from clienthello */
+    /* Remove cmsg from clienthello, trim the skb and ip payload length */
+    skb_trim(skb, cmsg_payload_len);
+    *p_ip_total_len = htons(ntohs(*p_ip_total_len) - cmsg_payload_len);
 
     /* Create FDs */
     fd_client = __tcp_restore_fd_create(instance->netspace, &__restore_info.client, &__restore_info.server);
@@ -604,12 +622,21 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
 errout:
     if(unlikely(fd_client > 0))
     {
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+        ksys_close(fd_client);
+#else
         sys_close(fd_client);
+#endif
     }
 
     if(unlikely(fd_server > 0))
     {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+        ksys_close(fd_server);
+#else
         sys_close(fd_server);
+#endif
     }
 
     return NF_ACCEPT;
@@ -622,7 +649,7 @@ static int __netfilter_ops_register(struct net * netspace,
 		struct nf_hook_ops * ops, const char * ifname, nf_hookfn * fn, void * arg)
 {
 	struct net_device * netdev;
-	int result;
+	int result = 0;
 
 	printk(KERN_DEBUG "netfilter ops register, ifname = %s\n", ifname) ; 
 	netdev = dev_get_by_name(&init_net, ifname);
@@ -652,20 +679,30 @@ errout:
 	return result;
 }
 
-static struct socket * tfe_kmod_unixdomain_socket_create(struct net * netspace, const char * path)
+static struct socket * __scm_socket_create(struct net * netspace, const char * path)
 {
 	struct sockaddr_un un_addr;
 	struct socket * un_sock = NULL;
 	int result;
 
+    char * rm_ops_argv[] = 
+    {
+        (char *)rm_program_path,
+        "-f",
+        (char *)path,
+        NULL
+    };
+
 	memset(&un_addr, 0, sizeof(un_addr));
 	un_addr.sun_family = AF_UNIX;
 	strcpy(un_addr.sun_path, path);
 
-	result = sys_unlinkat(AT_FDCWD, un_addr.sun_path, 0);
-	if (unlikely(result < 0 && result != -ENOENT))
+    pr_debug("%s %s %s\n", rm_program_path, "-f", path);
+    result = call_usermodehelper(rm_program_path, rm_ops_argv, rm_program_envp, UMH_WAIT_PROC);
+
+	if (unlikely(result < 0))
 	{
-		printk(KERN_ERR "Failed at removing file %s\n", path);
+		printk(KERN_ERR "Failed at removing file %s, result = %d\n", path, result);
 		goto errout;
 	}
        	
@@ -676,7 +713,7 @@ static struct socket * tfe_kmod_unixdomain_socket_create(struct net * netspace, 
 		goto errout;
 	}
 
-	result = un_sock->ops->bind(un_sock, (struct sockaddr *)&un_addr, sizeof(un_addr));
+	result = kernel_bind(un_sock, (struct sockaddr *)&un_addr, sizeof(un_addr));
 	if (unlikely(result < 0))
 	{
 		printk(KERN_ERR "Failed at binding unixdomain socket to %s", un_addr.sun_path);
@@ -690,32 +727,64 @@ errout:
 	return NULL;
 }
 
-static int tfe_kmod_instance_init(struct tfe_kmod_instance * instance)
+static int tfe_kmod_instance_deinit(struct tfe_kmod_instance * instance)
 {
-	instance->netspace = &init_net;
-	instance->scm_socket = tfe_kmod_unixdomain_socket_create(instance->netspace, instance->str_scm_socket_path);
-	if (unlikely(instance->scm_socket != NULL))
-	{
-		pr_err("Failed at creating scm socket for %s\n", instance->str_scm_socket_path);
-		return -1;
-	}
+    if(instance->scm_socket != NULL)
+    {
+        sock_release(instance->scm_socket);
+    }
+
+    if(instance->nf_hook_ops_cmsg_input.hook)
+    {
+        nf_unregister_net_hook(instance->netspace, &instance->nf_hook_ops_cmsg_input);
+    }
+
+    if(instance->nf_hook_ops_bfd_input.hook)
+    {
+        nf_unregister_net_hook(instance->netspace, &instance->nf_hook_ops_bfd_input);
+    }
 
 	return 0;
 }
 
-static int tfe_kmod_instance_deinit(struct tfe_kmod_instance * instance)
+static int tfe_kmod_instance_init(struct tfe_kmod_instance * instance)
 {
-	return 0;
+    int result = 0;
+
+	instance->netspace = &init_net;
+	instance->scm_socket = __scm_socket_create(instance->netspace, instance->str_scm_socket_path);
+	if (instance->scm_socket == NULL)
+	{
+		pr_err("Failed at creating scm socket for %s\n", instance->str_scm_socket_path);
+        goto errout;
+	}
+
+#if 0
+    result = __netfilter_ops_register(instance->netspace, &instance->nf_hook_ops_cmsg_input,
+            instance->ifname_cmsg_input, tfe_kernel_tcp_hook_entry, instance);
+
+    if (result < 0)
+    {
+        pr_err("Failed at register netfilter for cmsg at interface %s\n", instance->ifname_cmsg_input);
+        goto errout;
+    }
+#endif
+
+    return 0;
+
+errout:
+    tfe_kmod_instance_deinit(instance);
+    return -EFAULT;
 }
 
 static int __init tfe_kmod_init(void) 
 {
 	int result;
-
-	printk(KERN_INFO "Tango Frontend Engine Kernel Module, Version: %s\n", TFE_KMOD_VERSION);
+	pr_info("Tango Frontend Engine Kernel Module, Version: %s\n", TFE_KMOD_VERSION);
 
 	strlcpy(g_tfe_kmod_instance->ifname_cmsg_input, ifname_cmsg, sizeof(g_tfe_kmod_instance->ifname_cmsg_input));
 	strlcpy(g_tfe_kmod_instance->ifname_cmsg_input, ifname_bfd, sizeof(g_tfe_kmod_instance->ifname_bfd_input));
+    strlcpy(g_tfe_kmod_instance->str_scm_socket_path, scm_socket, sizeof(g_tfe_kmod_instance->str_scm_socket_path));
 
 	result = tfe_kmod_instance_init(g_tfe_kmod_instance);
 	if (unlikely(result < 0))
