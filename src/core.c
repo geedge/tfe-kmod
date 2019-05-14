@@ -127,7 +127,26 @@ MODULE_PARM_DESC(ifname_bfd, "Network interface for BFD keepalive message");
 module_param(scm_socket, charp, S_IRUGO);
 MODULE_PARM_DESC(scm_socket, "SCM socket file location");
 
-static void __tcp_restore_info_dump_to_log(const struct tcp_restore_info * info)
+static int __call_sys_close(int fd) __maybe_unused
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
+    return ksys_close(fd);
+#else
+    return sys_close(fd);
+#endif
+}
+
+static inline bool is_ipv4_pkt(const struct sk_buff * skb)
+{
+    return skb->protocol == htons(ETH_P_IP) && ip_hdr(skb)->version == 4;
+}
+
+static inline bool is_ipv6_pkt(const struct sk_buff * skb)
+{
+    return skb->protocol == htons(ETH_P_IPV6) && ipv6_hdr(skb)->version == 6;
+}
+
+static void __tcp_restore_info_dump_to_log(const struct tcp_restore_info * info) __maybe_unused
 {
 	return;
 }
@@ -162,7 +181,7 @@ static int __tcp_restore_info_parse_from_cmsg(const char * data, unsigned int da
 
 	if (unlikely(nr_tlvs >= 256))
 	{
-		printk(KERN_ERR "Invalid restore info format: numbers of tlvs is larger than 256, drop it.\n");
+		pr_err_ratelimited("Invalid restore info format: numbers of tlvs is larger than 256, drop it.\n");
 		goto invalid_format;
 	}
 
@@ -291,16 +310,8 @@ static int __fd_send_to_tfe_userspace(struct socket * un_sock,
         return result;
 	}
 
-    /* TODO: replace the sys_* functions with ksys_* when use future kernel version */
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
-    ksys_close(fd_client);
-    ksys_close(fd_server);
-#else
-    sys_close(fd_client);
-    sys_close(fd_server);
-#endif
-
+    __call_sys_close(fd_client);
+    __call_sys_close(fd_server);
 	return result;
 }
 
@@ -402,16 +413,6 @@ errout:
     return result;
 }
 
-static inline bool is_ipv4_pkt(const struct sk_buff * skb)
-{
-    return skb->protocol == htons(ETH_P_IP) && ip_hdr(skb)->version == 4;
-}
-
-static inline bool is_ipv6_pkt(const struct sk_buff * skb)
-{
-    return skb->protocol == htons(ETH_P_IPV6) && ipv6_hdr(skb)->version == 6;
-}
-
 static bool tcp_find_option(uint8_t option, const struct sk_buff *skb,
 		unsigned int protoff, unsigned int optlen, uint8_t * out_optlen, 
         char * out_optvalue, unsigned int out_optvalue_len)
@@ -507,7 +508,7 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
     int fd_server = 0;
 
     instance = (struct tfe_kmod_instance *)priv;
-    BUG_ON(instance->netspace != NULL);
+    BUG_ON(instance == NULL || instance->netspace == NULL);
 
     if(skb->protocol == htons(ETH_P_IP))
     {
@@ -622,21 +623,12 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
 errout:
     if(unlikely(fd_client > 0))
     {
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
-        ksys_close(fd_client);
-#else
-        sys_close(fd_client);
-#endif
+        __call_sys_close(fd_client);
     }
 
     if(unlikely(fd_server > 0))
     {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
-        ksys_close(fd_server);
-#else
-        sys_close(fd_server);
-#endif
+        __call_sys_close(fd_server);
     }
 
     return NF_ACCEPT;
@@ -651,7 +643,7 @@ static int __netfilter_ops_register(struct net * netspace,
 	struct net_device * netdev;
 	int result = 0;
 
-	printk(KERN_DEBUG "netfilter ops register, ifname = %s\n", ifname) ; 
+	pr_debug("netfilter ops register, ifname = %s\n", ifname) ; 
 	netdev = dev_get_by_name(&init_net, ifname);
 
 	if(unlikely(netdev == NULL))
@@ -664,11 +656,12 @@ static int __netfilter_ops_register(struct net * netspace,
 	ops->hooknum = NF_INET_PRE_ROUTING;
 	ops->pf = PF_INET;
 	ops->dev = netdev;
+    ops->priv = arg;
 
-	result = nf_register_net_hook(&init_net, ops);
+	result = nf_register_net_hook(netspace, ops);
 	if (unlikely(result < 0))
 	{
-		printk(KERN_ERR "cannot register netfilter ops for device %s, result = %d\n", ifname, result);
+		pr_err("cannot register netfilter ops for device %s, result = %d\n", ifname, result);
 		goto errout;
 	}
 
@@ -759,7 +752,6 @@ static int tfe_kmod_instance_init(struct tfe_kmod_instance * instance)
         goto errout;
 	}
 
-#if 0
     result = __netfilter_ops_register(instance->netspace, &instance->nf_hook_ops_cmsg_input,
             instance->ifname_cmsg_input, tfe_kernel_tcp_hook_entry, instance);
 
@@ -768,7 +760,6 @@ static int tfe_kmod_instance_init(struct tfe_kmod_instance * instance)
         pr_err("Failed at register netfilter for cmsg at interface %s\n", instance->ifname_cmsg_input);
         goto errout;
     }
-#endif
 
     return 0;
 
