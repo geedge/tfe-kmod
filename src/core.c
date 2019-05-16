@@ -15,6 +15,7 @@
 #include <linux/syscalls.h>
 #include <linux/version.h>
 
+#include "cmsg.h"
 
 #ifndef TFE_KMOD_VERSION
 #define TFE_KMOD_VERSION 	"Unknown"
@@ -31,21 +32,6 @@ MODULE_VERSION(TFE_KMOD_VERSION);
 #define TFE_STRING_SIZE 2048
 #endif
 
-enum tcp_restore_info_tlv_type
-{
-    TCP_RESTORE_INFO_TLV_SEQ,
-    TCP_RESTORE_INFO_TLV_ACK,
-    TCP_RESTORE_INFO_TLV_MSS_CLIENT,
-    TCP_RESTORE_INFO_TLV_MSS_SERVER,
-    TCP_RESTORE_INFO_TLV_WSACLE_CLIENT,
-    TCP_RESTORE_INFO_TLV_WSACLE_SERVER,
-    TCP_RESTORE_INFO_TLV_SACK_CLIENT,
-    TCP_RESTORE_INFO_TLV_SACK_SERVER,
-    TCP_RESTORE_INFO_TLV_TS_CLIENT,
-    TCP_RESTORE_INFO_TLV_TS_SERVER,
-    TCP_RESTORE_INFO_TLV_USER_DEFINED
-};
-
 struct tfe_kmod_instance
 {
     /* Path */
@@ -61,54 +47,6 @@ struct tfe_kmod_instance
     struct nf_hook_ops nf_hook_ops_cmsg_input;
     struct nf_hook_ops nf_hook_ops_bfd_input;
 };
-
-struct tcp_restore_info_endpoint
-{
-    struct sockaddr_storage addr;
-    bool wscale_perm;
-    bool timestamp_perm;
-    bool sack_perm;
-    uint16_t mss;
-    uint8_t wscale;
-};
-
-struct tcp_restore_info_global
-{
-    uint32_t seq;
-    uint32_t ack;
-};
-
-struct tcp_restore_info
-{
-    struct tcp_restore_info_global global;
-    struct tcp_restore_info_endpoint client;
-    struct tcp_restore_info_endpoint server;
-};
-
-struct tcp_restore_info_tlv
-{
-    uint16_t type;
-    uint16_t length;
-	
-    union
-    {
-        uint8_t value_as_uint8[0];
-        uint16_t value_as_uint16[0];
-        uint32_t value_as_uint32[0];
-        unsigned char value_as_string[0];
-    };
-
-} __attribute__((packed));
-
-struct tcp_restore_info_header
-{
-    uint8_t __magic__[2]; /* Must be 0x4d, 0x5a */
-    uint16_t nr_tlvs;
-    struct tcp_restore_info_tlv tlvs[0];
-} __attribute__((packed));
-
-#define TCP_RESTORE_TCPOPT_KIND      88
-#define TCP_RESTORE_TCPOPT_LENGTH    4
 
 static char * ifname_cmsg = "lo";
 static char * ifname_bfd = "lo";
@@ -127,7 +65,7 @@ MODULE_PARM_DESC(ifname_bfd, "Network interface for BFD keepalive message");
 module_param(scm_socket, charp, S_IRUGO);
 MODULE_PARM_DESC(scm_socket, "SCM socket file location");
 
-static int __call_sys_close(int fd) __maybe_unused
+static int __call_sys_close(int fd)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
     return ksys_close(fd);
@@ -145,131 +83,6 @@ static inline bool is_ipv6_pkt(const struct sk_buff * skb)
 {
     return skb->protocol == htons(ETH_P_IPV6) && ipv6_hdr(skb)->version == 6;
 }
-
-static void __tcp_restore_info_dump_to_log(const struct tcp_restore_info * info) __maybe_unused
-{
-    return;
-}
-
-static int __tcp_restore_info_parse_from_skb(struct sk_buff * skb, struct tcp_restore_info * out)
-{
-    struct iphdr * iphdr = ip_hdr(skb);
-    struct tcphdr * tcphdr = tcp_hdr(skb);
-
-    struct sockaddr_in * in_addr_client = (struct sockaddr_in *)&out->client.addr;
-    struct sockaddr_in * in_addr_server = (struct sockaddr_in *)&out->server.addr;
-
-    in_addr_client->sin_family = AF_INET;
-    in_addr_client->sin_addr.s_addr = iphdr->saddr;
-    in_addr_client->sin_port = tcphdr->source;
-
-    in_addr_server->sin_family = AF_INET;
-    in_addr_server->sin_addr.s_addr = iphdr->daddr;
-    in_addr_client->sin_port = tcphdr->dest;
-
-    return 0;
-}
-
-static int __tcp_restore_info_parse_from_cmsg(const char * data, unsigned int datalen, struct tcp_restore_info * out)
-{
-    struct tcp_restore_info_header * header = (struct tcp_restore_info_header *)data;
-    unsigned int tlv_iter;
-    unsigned int nr_tlvs;
-
-    BUG_ON(header->__magic__[0] != 0x4d || header->__magic__[1] != 0x5a);
-    nr_tlvs = ntohs(header->nr_tlvs);
-
-    if (unlikely(nr_tlvs >= 256))
-    {
-        pr_err_ratelimited("Invalid restore info format: numbers of tlvs is larger than 256, drop it.\n");
-        goto invalid_format;
-    }
-
-    if (unlikely(datalen < sizeof(struct tcp_restore_info_header)))
-    {
-        printk(KERN_ERR "Invalid restore info format: length is shorter than tlv header, drop it.\n");
-        goto invalid_format;
-    }
-
-    datalen -= sizeof(struct tcp_restore_info_header);
-    data += sizeof(struct tcp_restore_info_header);
-
-    for(tlv_iter = 0; tlv_iter < nr_tlvs; tlv_iter++)
-    {
-        struct tcp_restore_info_tlv * tlv = (struct tcp_restore_info_tlv *)data;
-        uint16_t tlv_type = ntohs(tlv->type);
-        uint16_t tlv_length = ntohs(tlv->length);
-
-        unsigned int __length = tlv_length + sizeof(struct tcp_restore_info_tlv);
-        if(unlikely(datalen < __length))
-        {
-            printk(KERN_ERR "Invalid restore info format: left space is smaller than tlv's length, drop it.\n");
-            goto invalid_format;
-        }
-
-
-#define __CHECK_TLV_LENGTH(x) do { if(unlikely(x != tlv_length))							\
-    printk(KERN_ERR "Invalid restore format: invalid tlv length, should be %u, actually is %u, drop it.\n", 	\
-            (unsigned int)tlv_length, (unsigned int)x);  goto invalid_format; } while(0)
-
-        switch(tlv_type)
-        {
-            case TCP_RESTORE_INFO_TLV_SEQ:
-                __CHECK_TLV_LENGTH(sizeof(uint32_t));
-                out->global.seq = ntohl(tlv->value_as_uint32[0]);
-                break;
-
-            case TCP_RESTORE_INFO_TLV_ACK:
-                __CHECK_TLV_LENGTH(sizeof(uint32_t));
-                out->global.ack = ntohl(tlv->value_as_uint32[0]);
-                break;
-
-            case TCP_RESTORE_INFO_TLV_TS_CLIENT:
-                __CHECK_TLV_LENGTH(sizeof(uint8_t));
-                out->client.timestamp_perm = !!(tlv->value_as_uint8[0]);
-                break;
-
-            case TCP_RESTORE_INFO_TLV_TS_SERVER:
-                __CHECK_TLV_LENGTH(sizeof(uint8_t));
-                out->server.timestamp_perm = !!(tlv->value_as_uint8[0]);
-                break;
-
-            case TCP_RESTORE_INFO_TLV_WSACLE_CLIENT:
-                __CHECK_TLV_LENGTH(sizeof(uint8_t));
-                out->client.wscale_perm = true;
-                out->client.wscale = tlv->value_as_uint8[0];
-                break;
-
-            case TCP_RESTORE_INFO_TLV_WSACLE_SERVER:
-                __CHECK_TLV_LENGTH(sizeof(uint8_t));
-                out->server.wscale_perm = true;
-                out->server.wscale = tlv->value_as_uint8[0];
-                break;
-
-            case TCP_RESTORE_INFO_TLV_MSS_CLIENT:
-                __CHECK_TLV_LENGTH(sizeof(uint16_t));
-                out->client.mss = ntohs(tlv->value_as_uint16[0]);
-                break;
-
-            case TCP_RESTORE_INFO_TLV_MSS_SERVER:
-                __CHECK_TLV_LENGTH(sizeof(uint16_t));
-                out->server.mss = ntohs(tlv->value_as_uint16[0]);
-                break;
-
-            default:
-                printk(KERN_ERR "Invalid restore info format: unsupported type, drop it.\n");
-                goto invalid_format;
-        }
-
-        data += __length;
-        datalen -= __length;
-    }
-
-    return 0;
-
-invalid_format:
-    return -EINVAL;
-} 
 
 static int __fd_send_to_tfe_userspace(struct socket * un_sock, 
         int fd_client, int fd_server, const uint8_t * msg, unsigned int msglen)
@@ -582,14 +395,14 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
     cmsg_payload_len = tcp_payload_len - restore_tcpopt_value;
 
     /* Construct restore info from packet */
-    result = __tcp_restore_info_parse_from_skb(skb, &__restore_info);
+    result = tcp_restore_info_parse_from_skb(skb, &__restore_info);
     if(unlikely(result < 0))
     {
         goto errout;
     }
 
     /* ClientHello with leader */
-    result = __tcp_restore_info_parse_from_cmsg(tcp_payload, tcp_payload_len, &__restore_info);
+    result = tcp_restore_info_parse_from_cmsg(tcp_payload, tcp_payload_len, &__restore_info);
     if(unlikely(result < 0))
     {
         goto errout;
