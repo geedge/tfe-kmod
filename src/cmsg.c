@@ -7,8 +7,57 @@
 
 #include "cmsg.h"
 
+extern const char * inet_ntop(int af, const void *src, char *dst, size_t size);
+
 void tcp_restore_info_dump_to_log(const struct tcp_restore_info * info)
 {
+    char str_client_addr[64];
+    char str_server_addr[64];
+
+    const struct tcp_restore_info_endpoint * client = &info->client;
+    const struct tcp_restore_info_endpoint * server = &info->server;
+
+    BUG_ON(client->addr.ss_family != server->addr.ss_family);
+    BUG_ON(client->addr.ss_family != AF_INET && client->addr.ss_family != AF_INET6);
+
+    if(client->addr.ss_family == AF_INET)
+    {
+        struct sockaddr_in * sk_client = (struct sockaddr_in *)&client->addr;
+        struct sockaddr_in * sk_server = (struct sockaddr_in *)&client->addr;
+        uint16_t port_client = ntohs(sk_client->sin_port);
+        uint16_t port_server = ntohs(sk_server->sin_port);
+
+        inet_ntop(AF_INET, &sk_client->sin_addr, str_client_addr, sizeof(str_client_addr));
+        inet_ntop(AF_INET, &sk_server->sin_addr, str_server_addr, sizeof(str_client_addr));
+
+        pr_debug("tcp_restore_info %p: %s:%hu->%s:%hu, seq=%u, ack=%u\n", info, 
+                 str_client_addr, port_client, str_server_addr, port_server, info->global.seq, info->global.ack);
+
+    }
+    else if(client->addr.ss_family == AF_INET6)
+    {
+        struct sockaddr_in6 * sk_client = (struct sockaddr_in6 *)&client->addr;
+        struct sockaddr_in6 * sk_server = (struct sockaddr_in6 *)&client->addr;
+        uint16_t port_client = ntohs(sk_client->sin6_port);
+        uint16_t port_server = ntohs(sk_server->sin6_port);
+
+        inet_ntop(AF_INET6, &sk_client->sin6_addr, str_client_addr, sizeof(str_client_addr));
+        inet_ntop(AF_INET6, &sk_server->sin6_addr, str_server_addr, sizeof(str_client_addr));
+
+        pr_debug("tcp_restore_info %p: %s:%hu->%s:%hu, seq=%u, ack=%u\n", info, 
+                 str_client_addr, port_client, str_server_addr, port_server, info->global.seq, info->global.ack);
+    }
+
+    pr_debug("tcp_restore_info %p: client, mss=%u, wscale_perm=%u, wscale=%u, ts=%u, sack=%u\n", 
+             info, client->mss, client->wscale_perm ? 1 : 0,
+             client->wscale, client->timestamp_perm ? 1 : 0,
+             client->sack_perm ? 1 : 0);
+
+    pr_debug("tcp_restore_info %p: server, mss=%u, wscale_perm=%u, wscale=%u, ts=%u, sack=%u\n", 
+             info, server->mss, server->wscale_perm ? 1 : 0,
+             server->wscale, server->timestamp_perm ? 1 : 0,
+             server->sack_perm ? 1 : 0);
+
     return;
 }
 

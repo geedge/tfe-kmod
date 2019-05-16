@@ -394,6 +394,8 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
     cmsg_payload = tcp_payload + restore_tcpopt_value;
     cmsg_payload_len = tcp_payload_len - restore_tcpopt_value;
 
+    pr_devel("Hit cmsg packet!!\n");
+
     /* Construct restore info from packet */
     result = tcp_restore_info_parse_from_skb(skb, &__restore_info);
     if(unlikely(result < 0))
@@ -424,6 +426,8 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
     {
         goto errout;
     }
+
+    tcp_restore_info_dump_to_log(&__restore_info);
 
     /* Send FDs to userspace application */
     result = __fd_send_to_tfe_userspace(instance->scm_socket, fd_client, fd_server, NULL, 0);
@@ -587,7 +591,7 @@ static int __init tfe_kmod_init(void)
     pr_info("Tango Frontend Engine Kernel Module, Version: %s\n", TFE_KMOD_VERSION);
 
     strlcpy(g_tfe_kmod_instance->ifname_cmsg_input, ifname_cmsg, sizeof(g_tfe_kmod_instance->ifname_cmsg_input));
-    strlcpy(g_tfe_kmod_instance->ifname_cmsg_input, ifname_bfd, sizeof(g_tfe_kmod_instance->ifname_bfd_input));
+    strlcpy(g_tfe_kmod_instance->ifname_bfd_input, ifname_bfd, sizeof(g_tfe_kmod_instance->ifname_bfd_input));
     strlcpy(g_tfe_kmod_instance->str_scm_socket_path, scm_socket, sizeof(g_tfe_kmod_instance->str_scm_socket_path));
 
     result = tfe_kmod_instance_init(g_tfe_kmod_instance);
