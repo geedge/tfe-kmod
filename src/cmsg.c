@@ -23,7 +23,7 @@ void tcp_restore_info_dump_to_log(const struct tcp_restore_info * info)
     if(client->addr.ss_family == AF_INET)
     {
         struct sockaddr_in * sk_client = (struct sockaddr_in *)&client->addr;
-        struct sockaddr_in * sk_server = (struct sockaddr_in *)&client->addr;
+        struct sockaddr_in * sk_server = (struct sockaddr_in *)&server->addr;
         uint16_t port_client = ntohs(sk_client->sin_port);
         uint16_t port_server = ntohs(sk_server->sin_port);
 
@@ -37,7 +37,7 @@ void tcp_restore_info_dump_to_log(const struct tcp_restore_info * info)
     else if(client->addr.ss_family == AF_INET6)
     {
         struct sockaddr_in6 * sk_client = (struct sockaddr_in6 *)&client->addr;
-        struct sockaddr_in6 * sk_server = (struct sockaddr_in6 *)&client->addr;
+        struct sockaddr_in6 * sk_server = (struct sockaddr_in6 *)&server->addr;
         uint16_t port_client = ntohs(sk_client->sin6_port);
         uint16_t port_server = ntohs(sk_server->sin6_port);
 
@@ -75,7 +75,7 @@ int tcp_restore_info_parse_from_skb(struct sk_buff * skb, struct tcp_restore_inf
 
     in_addr_server->sin_family = AF_INET;
     in_addr_server->sin_addr.s_addr = iphdr->daddr;
-    in_addr_client->sin_port = tcphdr->dest;
+    in_addr_server->sin_port = tcphdr->dest;
 
     return 0;
 }
@@ -86,9 +86,13 @@ int tcp_restore_info_parse_from_cmsg(const char * data, unsigned int datalen, st
     unsigned int tlv_iter;
     unsigned int nr_tlvs;
 
-    BUG_ON(header->__magic__[0] != 0x4d || header->__magic__[1] != 0x5a);
-    nr_tlvs = ntohs(header->nr_tlvs);
+    if(unlikely(header->__magic__[0] != 0x4d || header->__magic__[1] != 0x5a))
+    {
+        pr_err("Invalid restore info format: wrong magic, drop it.\n");
+        goto invalid_format;
+    }
 
+    nr_tlvs = ntohs(header->nr_tlvs);
     if (unlikely(nr_tlvs >= 256))
     {
         pr_err_ratelimited("Invalid restore info format: numbers of tlvs is larger than 256, drop it.\n");
@@ -110,17 +114,24 @@ int tcp_restore_info_parse_from_cmsg(const char * data, unsigned int datalen, st
         uint16_t tlv_type = ntohs(tlv->type);
         uint16_t tlv_length = ntohs(tlv->length);
 
-        unsigned int __length = tlv_length + sizeof(struct tcp_restore_info_tlv);
+        unsigned int __length = tlv_length;
         if(unlikely(datalen < __length))
         {
-            printk(KERN_ERR "Invalid restore info format: left space is smaller than tlv's length, drop it.\n");
+            printk(KERN_ERR "Invalid restore info format: left space is smaller than tlv's length, "
+                    "datalen is %u, tlv's length is %u, drop it.\n", datalen, __length); goto invalid_format;
+        }
+
+        if(unlikely(tlv_length < sizeof(uint16_t) * 2))
+        {
+            printk(KERN_ERR "Invalid restore info format: invalid tlv length, should larger than sizeof(type) + sizeof(length).\n");
             goto invalid_format;
         }
 
+        tlv_length -= sizeof(uint16_t) * 2;
 
-#define __CHECK_TLV_LENGTH(x) do { if(unlikely(x != tlv_length))							\
+#define __CHECK_TLV_LENGTH(x) do { if(unlikely(x != tlv_length)) {                                              \
     printk(KERN_ERR "Invalid restore format: invalid tlv length, should be %u, actually is %u, drop it.\n", 	\
-            (unsigned int)tlv_length, (unsigned int)x);  goto invalid_format; } while(0)
+            (unsigned int)x, (unsigned int)tlv_length);  goto invalid_format; }} while(0)
 
         switch(tlv_type)
         {
@@ -156,6 +167,16 @@ int tcp_restore_info_parse_from_cmsg(const char * data, unsigned int datalen, st
                 out->server.wscale = tlv->value_as_uint8[0];
                 break;
 
+            case TCP_RESTORE_INFO_TLV_SACK_CLIENT:
+                __CHECK_TLV_LENGTH(sizeof(uint8_t));
+                out->client.sack_perm = true;
+                break;
+
+            case TCP_RESTORE_INFO_TLV_SACK_SERVER:
+                __CHECK_TLV_LENGTH(sizeof(uint8_t));
+                out->server.sack_perm = true;
+                break;
+
             case TCP_RESTORE_INFO_TLV_MSS_CLIENT:
                 __CHECK_TLV_LENGTH(sizeof(uint16_t));
                 out->client.mss = ntohs(tlv->value_as_uint16[0]);
@@ -166,8 +187,11 @@ int tcp_restore_info_parse_from_cmsg(const char * data, unsigned int datalen, st
                 out->server.mss = ntohs(tlv->value_as_uint16[0]);
                 break;
 
+            case TCP_RESTORE_INFO_TLV_USER_DEFINED:
+                break;
+
             default:
-                printk(KERN_ERR "Invalid restore info format: unsupported type, drop it.\n");
+                printk(KERN_ERR "Invalid restore info format: unsupported type %x, drop it.\n", tlv_type);
                 goto invalid_format;
         }
 
@@ -178,5 +202,6 @@ int tcp_restore_info_parse_from_cmsg(const char * data, unsigned int datalen, st
     return 0;
 
 invalid_format:
+    pr_err("cmsg parser fail!\n");
     return -EINVAL;
 } 

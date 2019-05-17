@@ -36,6 +36,7 @@ struct tfe_kmod_instance
 {
     /* Path */
     char str_scm_socket_path[PATH_MAX];
+    struct sockaddr_un sk_scm_socket_path;
 
     /* Config */
     char ifname_cmsg_input[IFNAMSIZ];
@@ -46,11 +47,14 @@ struct tfe_kmod_instance
     struct socket * scm_socket;
     struct nf_hook_ops nf_hook_ops_cmsg_input;
     struct nf_hook_ops nf_hook_ops_bfd_input;
+    struct net_device * netdev_cmsg_input;
+    struct net_device * netdev_bfd_input;
 };
 
 static char * ifname_cmsg = "lo";
 static char * ifname_bfd = "lo";
 static char * scm_socket = "/var/run/.tfe_kmod_scm_socket";
+static char * scm_socket_kern = "/var/run/.tfe_kmod_scm_socket_kern";
 
 static const char * rm_program_path = "/bin/rm";
 static char * rm_program_envp[] = { "HOME=/", "TERM=linux", "PATH=/usr/bin:/bin", NULL };
@@ -95,18 +99,24 @@ static int __fd_send_to_tfe_userspace(struct socket * un_sock,
 
     struct cmsghdr *cmsgp;
     struct msghdr msgh;
+    struct sockaddr_un __sk_scm_socket_path;
     int result;
 
     struct kvec iv;
     iv.iov_base = (void *)msg;
     iv.iov_len = msglen;
+  
+    /* Construct target unix domain address */
+    __sk_scm_socket_path.sun_family = AF_UNIX;
+    strlcpy(__sk_scm_socket_path.sun_path, g_tfe_kmod_instance->str_scm_socket_path, sizeof(__sk_scm_socket_path.sun_path));
 
     memset(&msgh, 0, sizeof(msgh));
     msgh.msg_name = NULL;
     msgh.msg_namelen = 0;
     msgh.msg_control = controlMsg.buf;
     msgh.msg_controllen = sizeof(controlMsg.buf);
-	
+    msgh.msg_flags = MSG_DONTWAIT;
+
     memset(controlMsg.buf, 0, sizeof(controlMsg.buf));
     cmsgp = CMSG_FIRSTHDR(&msgh);
     cmsgp->cmsg_len = CMSG_LEN(sizeof(int) * 2);
@@ -176,7 +186,7 @@ static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_resto
         goto errout;
     }
 
-    result = kernel_connect(__sock, (struct sockaddr *)&endpoint->addr, sizeof(endpoint->addr), 0);
+    result = kernel_connect(__sock, (struct sockaddr *)&peer->addr, sizeof(peer->addr), 0);
     if (unlikely(result < 0))
     {
         printk(KERN_ERR "Failed at connect(), result = %d\n", result);
@@ -235,7 +245,7 @@ static bool tcp_find_option(uint8_t option, const struct sk_buff *skb,
     uint8_t _opt[60 - sizeof(struct tcphdr)];
     unsigned int i;
 
-    pr_debug("finding option\n");
+    pr_debug("skb=%p, protooff=%u, optlen=%u\n", skb, protoff, optlen);
 
     if (!optlen)
         return false;
@@ -244,6 +254,7 @@ static bool tcp_find_option(uint8_t option, const struct sk_buff *skb,
     op = skb_header_pointer(skb, protoff + sizeof(struct tcphdr), optlen, _opt);
     if (op == NULL) 
     {
+        pr_debug("skb=%p, don't have whole header, ignore it.\n", skb);
         return false;
     }
 
@@ -302,7 +313,7 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
     unsigned int tcp_hdr_len;
 
     /* TCP Options */
-    uint32_t restore_tcpopt_value;
+    uint16_t restore_tcpopt_value;
     uint8_t restore_tcpopt_length;
     bool is_hit_tcpopt;
 
@@ -322,6 +333,11 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
 
     instance = (struct tfe_kmod_instance *)priv;
     BUG_ON(instance == NULL || instance->netspace == NULL);
+
+    if(state->in->ifindex != instance->netdev_cmsg_input->ifindex)
+    {
+        goto not_mine;
+    }
 
     if(skb->protocol == htons(ETH_P_IP))
     {
@@ -370,7 +386,7 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
             tcp_hdr_len - sizeof(struct tcphdr), &restore_tcpopt_length, 
             (char *)&restore_tcpopt_value, sizeof(restore_tcpopt_value));
 
-    if(!is_hit_tcpopt)
+    if(!is_hit_tcpopt || restore_tcpopt_length != 2)
     {
         goto not_mine;
     }
@@ -381,20 +397,24 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
         goto errout;
     }
 
-    /* Check */
-    BUG_ON(skb_transport_offset(skb) < skb_mac_offset(skb));
-    BUG_ON(skb_transport_offset(skb) - skb_mac_offset(skb) < tcp_hdr_len);
+    restore_tcpopt_value = ntohs(restore_tcpopt_value);
+
+    /* recheck */
+    BUG_ON(!(skb_transport_header(skb) != NULL));
+    BUG_ON(!(skb->len >= (skb_transport_offset(skb) + tcp_hdr_len)));
 
     /* TCP Payload */
     tcp_payload = skb_transport_header(skb) + tcp_hdr_len;
-    tcp_payload_len = skb_transport_offset(skb) - skb_mac_offset(skb) - tcp_hdr_len;
+    tcp_payload_len = skb->len - skb_transport_offset(skb) - tcp_hdr_len;
+
+    pr_devel("tcp_payload_len=%u, restore_tcpopt_value=%u\n", tcp_payload_len, restore_tcpopt_value);
 
     /* Cmsg */
-    BUG_ON(tcp_payload_len >= restore_tcpopt_value);
+    BUG_ON(tcp_payload_len < restore_tcpopt_value);
     cmsg_payload = tcp_payload + restore_tcpopt_value;
     cmsg_payload_len = tcp_payload_len - restore_tcpopt_value;
 
-    pr_devel("Hit cmsg packet!!\n");
+    pr_devel("cmsg_payload=%p, cmsg_payload_len=%u\n", cmsg_payload, cmsg_payload_len);
 
     /* Construct restore info from packet */
     result = tcp_restore_info_parse_from_skb(skb, &__restore_info);
@@ -404,11 +424,13 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
     }
 
     /* ClientHello with leader */
-    result = tcp_restore_info_parse_from_cmsg(tcp_payload, tcp_payload_len, &__restore_info);
+    result = tcp_restore_info_parse_from_cmsg(cmsg_payload, cmsg_payload_len, &__restore_info);
     if(unlikely(result < 0))
     {
         goto errout;
     }
+
+    tcp_restore_info_dump_to_log(&__restore_info);
 
     /* Remove cmsg from clienthello, trim the skb and ip payload length */
     skb_trim(skb, cmsg_payload_len);
@@ -427,15 +449,14 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
         goto errout;
     }
 
-    tcp_restore_info_dump_to_log(&__restore_info);
-
     /* Send FDs to userspace application */
-    result = __fd_send_to_tfe_userspace(instance->scm_socket, fd_client, fd_server, NULL, 0);
+    result = __fd_send_to_tfe_userspace(instance->scm_socket, fd_client, fd_server, cmsg_payload, cmsg_payload_len);
     if(unlikely(result < 0))
     {
         goto errout;
     }
 
+    return NF_ACCEPT;
 
 errout:
     if(unlikely(fd_client > 0))
@@ -457,22 +478,12 @@ not_mine:
 static int __netfilter_ops_register(struct net * netspace, 
         struct nf_hook_ops * ops, const char * ifname, nf_hookfn * fn, void * arg)
 {
-    struct net_device * netdev;
     int result = 0;
-
-    pr_debug("netfilter ops register, ifname = %s\n", ifname) ; 
-    netdev = dev_get_by_name(&init_net, ifname);
-
-    if(unlikely(netdev == NULL))
-    {
-        printk(KERN_ERR "cannot find device %s, netfilter register failed.\n", ifname);
-        goto errout;
-    }
-
+    
     ops->hook = fn;
     ops->hooknum = NF_INET_PRE_ROUTING;
     ops->pf = PF_INET;
-    ops->dev = netdev;
+    ops->dev = NULL;
     ops->priv = arg;
 
     result = nf_register_net_hook(netspace, ops);
@@ -485,13 +496,14 @@ static int __netfilter_ops_register(struct net * netspace,
     return result;
 
 errout:
-    if(netdev != NULL) dev_put(netdev);
     return result;
 }
 
 static struct socket * __scm_socket_create(struct net * netspace, const char * path)
 {
     struct sockaddr_un un_addr;
+    struct sockaddr_un un_addr_target;
+
     struct socket * un_sock = NULL;
     int result;
 
@@ -506,6 +518,10 @@ static struct socket * __scm_socket_create(struct net * netspace, const char * p
     memset(&un_addr, 0, sizeof(un_addr));
     un_addr.sun_family = AF_UNIX;
     strcpy(un_addr.sun_path, path);
+
+    memset(&un_addr_target, 0, sizeof(un_addr_target));
+    un_addr_target.sun_family = AF_UNIX;
+    strcpy(un_addr_target.sun_path, g_tfe_kmod_instance->str_scm_socket_path);
 
     pr_debug("%s %s %s\n", rm_program_path, "-f", path);
     result = call_usermodehelper(rm_program_path, rm_ops_argv, rm_program_envp, UMH_WAIT_PROC);
@@ -523,10 +539,10 @@ static struct socket * __scm_socket_create(struct net * netspace, const char * p
         goto errout;
     }
 
-    result = kernel_bind(un_sock, (struct sockaddr *)&un_addr, sizeof(un_addr));
+    result = kernel_connect(un_sock, (struct sockaddr *)&un_addr_target, sizeof(un_addr_target), 0);
     if (unlikely(result < 0))
     {
-        printk(KERN_ERR "Failed at binding unixdomain socket to %s", un_addr.sun_path);
+        printk(KERN_ERR "Failed at connection unixdomain socket to %s\n", un_addr_target.sun_path);
         goto errout;
     }
 
@@ -554,6 +570,16 @@ static int tfe_kmod_instance_deinit(struct tfe_kmod_instance * instance)
         nf_unregister_net_hook(instance->netspace, &instance->nf_hook_ops_bfd_input);
     }
 
+    if(instance->netdev_bfd_input)
+    {
+        dev_put(instance->netdev_bfd_input);
+    }
+
+    if(instance->netdev_cmsg_input)
+    {
+        dev_put(instance->netdev_cmsg_input);
+    }
+
     return 0;
 }
 
@@ -562,12 +588,24 @@ static int tfe_kmod_instance_init(struct tfe_kmod_instance * instance)
     int result = 0;
 
     instance->netspace = &init_net;
-    instance->scm_socket = __scm_socket_create(instance->netspace, instance->str_scm_socket_path);
+    instance->scm_socket = __scm_socket_create(instance->netspace, scm_socket_kern);
     if (instance->scm_socket == NULL)
     {
-        pr_err("Failed at creating scm socket for %s\n", instance->str_scm_socket_path);
+        pr_err("Failed at creating scm socket for %s\n", scm_socket_kern);
         goto errout;
     }
+
+    instance->sk_scm_socket_path.sun_family = AF_UNIX;
+    strcpy(instance->sk_scm_socket_path.sun_path, instance->str_scm_socket_path);
+
+    instance->netdev_cmsg_input = dev_get_by_name(instance->netspace, instance->ifname_cmsg_input);
+    if(instance->netdev_cmsg_input == NULL)
+    {
+        pr_err("Failed at finding cmsg input device %s\n", instance->ifname_cmsg_input);
+        goto errout;
+    }
+
+    pr_info("CMSG Incoming Interface: %s(%p)\n", instance->netdev_cmsg_input->name, instance->netdev_cmsg_input);
 
     result = __netfilter_ops_register(instance->netspace, &instance->nf_hook_ops_cmsg_input,
             instance->ifname_cmsg_input, tfe_kernel_tcp_hook_entry, instance);
