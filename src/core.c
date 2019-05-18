@@ -55,6 +55,7 @@ static char * ifname_cmsg = "lo";
 static char * ifname_bfd = "lo";
 static char * scm_socket = "/var/run/.tfe_kmod_scm_socket";
 static char * scm_socket_kern = "/var/run/.tfe_kmod_scm_socket_kern";
+static unsigned int fd_so_mask = 0x65;
 
 static const char * rm_program_path = "/bin/rm";
 static char * rm_program_envp[] = { "HOME=/", "TERM=linux", "PATH=/usr/bin:/bin", NULL };
@@ -99,17 +100,12 @@ static int __fd_send_to_tfe_userspace(struct socket * un_sock,
 
     struct cmsghdr *cmsgp;
     struct msghdr msgh;
-    struct sockaddr_un __sk_scm_socket_path;
     int result;
 
     struct kvec iv;
     iv.iov_base = (void *)msg;
     iv.iov_len = msglen;
   
-    /* Construct target unix domain address */
-    __sk_scm_socket_path.sun_family = AF_UNIX;
-    strlcpy(__sk_scm_socket_path.sun_path, g_tfe_kmod_instance->str_scm_socket_path, sizeof(__sk_scm_socket_path.sun_path));
-
     memset(&msgh, 0, sizeof(msgh));
     msgh.msg_name = NULL;
     msgh.msg_namelen = 0;
@@ -123,8 +119,8 @@ static int __fd_send_to_tfe_userspace(struct socket * un_sock,
     cmsgp->cmsg_level = SOL_SOCKET;
     cmsgp->cmsg_type = SCM_RIGHTS;
 
-    ((int *) CMSG_DATA(cmsgp))[0] = fd_client;
-    ((int *) CMSG_DATA(cmsgp))[1] = fd_server;
+    ((int *) CMSG_DATA(cmsgp))[0] = fd_server;
+    ((int *) CMSG_DATA(cmsgp))[1] = fd_client;
 
     result = kernel_sendmsg(un_sock, &msgh, &iv, 1, msglen);
     if(unlikely(result < 0))
@@ -135,6 +131,7 @@ static int __fd_send_to_tfe_userspace(struct socket * un_sock,
 
     __call_sys_close(fd_client);
     __call_sys_close(fd_server);
+
     return result;
 }
 
@@ -147,6 +144,9 @@ static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_resto
 
     int result;
     int sockopt;
+
+    struct tcp_repair_opt tcp_repair_opts[8];
+    unsigned int nr_tcp_repair_opts = 0;
 
     result = sock_create_kern(netspace, AF_INET, SOCK_STREAM, IPPROTO_TCP, &__sock);
     if (unlikely(result < 0))
@@ -165,13 +165,6 @@ static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_resto
         goto errout;
     }
 
-    result = kernel_setsockopt(__sock, SOL_TCP, TCP_REPAIR, (char *)&sockopt, sizeof(sockopt));
-    if (unlikely(result < 0))
-    {
-        printk(KERN_ERR "Failed at setsockopt(TCP_REPAIR) begin, result = %d\n", result);
-        goto errout;
-    }
-
     result = kernel_setsockopt(__sock, SOL_IP, IP_TRANSPARENT, (char *)&sockopt, sizeof(sockopt));
     if (unlikely(result < 0))
     {
@@ -179,6 +172,85 @@ static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_resto
         goto errout;
     }
 
+    result = kernel_setsockopt(__sock, SOL_TCP, TCP_REPAIR, (char *)&sockopt, sizeof(sockopt));
+    if (unlikely(result < 0))
+    {
+        printk(KERN_ERR "Failed at setsockopt(TCP_REPAIR) begin, result = %d\n", result);
+        goto errout;
+    }
+
+    sockopt = fd_so_mask;
+    result = kernel_setsockopt(__sock, SOL_SOCKET, SO_MARK, (char *)&sockopt, sizeof(sockopt));
+    if (unlikely(result < 0))
+    {
+        printk(KERN_ERR "Failed at setsockopt(SO_MARK), result = %d\n", result);
+        goto errout;
+    }
+
+    /* Setup SEQ/ACK and TCP options */
+    sockopt = TCP_SEND_QUEUE;
+    result = kernel_setsockopt(__sock, SOL_TCP, TCP_REPAIR_QUEUE, (char *)&sockopt, sizeof(sockopt));
+    if (unlikely(result < 0))
+    {
+        printk(KERN_ERR "Failed at setsockopt(TCP_REPAIR_QUEUE), result = %d\n", result);
+        goto errout;
+    }
+
+    sockopt = endpoint->seq;
+    result = kernel_setsockopt(__sock, SOL_TCP, TCP_QUEUE_SEQ, (char *)&sockopt, sizeof(sockopt));
+    if (unlikely(result < 0))
+    {
+        printk(KERN_ERR "Failed at setsockopt(TCP_QUEUE_SEQ), result = %d\n", result);
+        goto errout;
+    }
+
+    sockopt = TCP_RECV_QUEUE;
+    result = kernel_setsockopt(__sock, SOL_TCP, TCP_REPAIR_QUEUE, (char *)&sockopt, sizeof(sockopt));
+    if (unlikely(result < 0))
+    {
+        printk(KERN_ERR "Failed at setsockopt(TCP_QUEUE_SEQ), result = %d\n", result);
+        goto errout;
+    }
+
+    sockopt = endpoint->ack;
+    result = kernel_setsockopt(__sock, SOL_TCP, TCP_QUEUE_SEQ, (char *)&sockopt, sizeof(sockopt));
+    if (unlikely(result < 0))
+    {
+        printk(KERN_ERR "Failed at setsockopt(TCP_QUEUE_SEQ), result = %d\n", result);
+        goto errout;
+    }
+
+#ifndef TCPOPT_MAXSEG
+#define TCPOPT_MAXSEG            2
+#endif
+
+#ifndef TCPOPT_WINDOW
+#define TCPOPT_WINDOW            3
+#endif
+
+#ifndef TCPOPT_SACK_PERMITTED
+#define TCPOPT_SACK_PERMITTED    4
+#endif
+
+    tcp_repair_opts[nr_tcp_repair_opts].opt_code = TCPOPT_MAXSEG;
+    tcp_repair_opts[nr_tcp_repair_opts].opt_val = min(endpoint->mss, peer->mss);
+    nr_tcp_repair_opts++;
+
+    if (endpoint->sack_perm && peer->sack_perm)
+    {
+        tcp_repair_opts[nr_tcp_repair_opts].opt_code = TCPOPT_SACK_PERMITTED;
+        tcp_repair_opts[nr_tcp_repair_opts].opt_val = 0;
+        nr_tcp_repair_opts++;
+    }
+
+    if (endpoint->wscale_perm)
+    {
+        tcp_repair_opts[nr_tcp_repair_opts].opt_code = TCPOPT_WINDOW;
+        tcp_repair_opts[nr_tcp_repair_opts].opt_val = (endpoint->wscale << 16 ) | peer->wscale;
+        nr_tcp_repair_opts++;
+    }
+
+    /* Bind address and connect to peer endpoint */
     result = kernel_bind(__sock, (struct sockaddr *)&endpoint->addr, sizeof(endpoint->addr));
     if (unlikely(result < 0))
     {
@@ -190,6 +262,15 @@ static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_resto
     if (unlikely(result < 0))
     {
         printk(KERN_ERR "Failed at connect(), result = %d\n", result);
+        goto errout;
+    }
+
+    result = kernel_setsockopt(__sock, SOL_TCP, TCP_REPAIR_OPTIONS, (char *)tcp_repair_opts, 
+            nr_tcp_repair_opts * sizeof(struct tcp_repair_opt));
+
+    if (unlikely(result < 0))
+    {
+        printk(KERN_ERR "Failed at setsockopt(TCP_REPAIR_OPTIONS), result = %d\n", result);
         goto errout;
     }
 
@@ -295,6 +376,11 @@ static bool tcp_find_option(uint8_t option, const struct sk_buff *skb,
     }
 
     return false;
+}
+
+static inline bool tcp_checksum_complete(struct sk_buff *skb)
+{
+    return !skb_csum_unnecessary(skb) && __skb_checksum_complete(skb);
 }
 
 unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
@@ -433,8 +519,14 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
     tcp_restore_info_dump_to_log(&__restore_info);
 
     /* Remove cmsg from clienthello, trim the skb and ip payload length */
+
+#if 0
     skb_trim(skb, cmsg_payload_len);
     *p_ip_total_len = htons(ntohs(*p_ip_total_len) - cmsg_payload_len);
+
+    skb->csum_valid = 1;
+    pr_devel("checksum: %d\n", tcp_checksum_complete(skb) ? 1 : 0);
+#endif
 
     /* Create FDs */
     fd_client = __tcp_restore_fd_create(instance->netspace, &__restore_info.client, &__restore_info.server);
@@ -456,7 +548,7 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
         goto errout;
     }
 
-    return NF_ACCEPT;
+    return NF_DROP;
 
 errout:
     if(unlikely(fd_client > 0))

@@ -21,6 +21,8 @@ enum tcp_restore_info_tlv_type
 struct tcp_restore_info_endpoint
 {
     struct sockaddr_storage addr;
+    uint32_t seq;
+    uint32_t ack;
     bool wscale_perm;
     bool timestamp_perm;
     bool sack_perm;
@@ -28,15 +30,8 @@ struct tcp_restore_info_endpoint
     uint8_t wscale;
 };
 
-struct tcp_restore_info_global
-{
-    uint32_t seq;
-    uint32_t ack;
-};
-
 struct tcp_restore_info
 {
-    struct tcp_restore_info_global global;
     struct tcp_restore_info_endpoint client;
     struct tcp_restore_info_endpoint server;
 };

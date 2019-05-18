@@ -31,7 +31,7 @@ void tcp_restore_info_dump_to_log(const struct tcp_restore_info * info)
         inet_ntop(AF_INET, &sk_server->sin_addr, str_server_addr, sizeof(str_client_addr));
 
         pr_debug("tcp_restore_info %p: %s:%hu->%s:%hu, seq=%u, ack=%u\n", info, 
-                 str_client_addr, port_client, str_server_addr, port_server, info->global.seq, info->global.ack);
+                 str_client_addr, port_client, str_server_addr, port_server, info->client.seq, info->client.ack);
 
     }
     else if(client->addr.ss_family == AF_INET6)
@@ -45,7 +45,7 @@ void tcp_restore_info_dump_to_log(const struct tcp_restore_info * info)
         inet_ntop(AF_INET6, &sk_server->sin6_addr, str_server_addr, sizeof(str_client_addr));
 
         pr_debug("tcp_restore_info %p: %s:%hu->%s:%hu, seq=%u, ack=%u\n", info, 
-                 str_client_addr, port_client, str_server_addr, port_server, info->global.seq, info->global.ack);
+                 str_client_addr, port_client, str_server_addr, port_server, info->client.seq, info->client.ack);
     }
 
     pr_debug("tcp_restore_info %p: client, mss=%u, wscale_perm=%u, wscale=%u, ts=%u, sack=%u\n", 
@@ -137,12 +137,14 @@ int tcp_restore_info_parse_from_cmsg(const char * data, unsigned int datalen, st
         {
             case TCP_RESTORE_INFO_TLV_SEQ:
                 __CHECK_TLV_LENGTH(sizeof(uint32_t));
-                out->global.seq = ntohl(tlv->value_as_uint32[0]);
+                out->client.seq = ntohl(tlv->value_as_uint32[0]);
+                out->server.ack = ntohl(tlv->value_as_uint32[0]);
                 break;
 
             case TCP_RESTORE_INFO_TLV_ACK:
                 __CHECK_TLV_LENGTH(sizeof(uint32_t));
-                out->global.ack = ntohl(tlv->value_as_uint32[0]);
+                out->client.ack = ntohl(tlv->value_as_uint32[0]);
+                out->server.seq = ntohl(tlv->value_as_uint32[0]);
                 break;
 
             case TCP_RESTORE_INFO_TLV_TS_CLIENT:
