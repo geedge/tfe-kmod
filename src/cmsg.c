@@ -189,6 +189,7 @@ int tcp_restore_info_parse_from_cmsg(const char * data, unsigned int datalen, st
                 out->server.mss = ntohs(tlv->value_as_uint16[0]);
                 break;
 
+            case TCP_RESTORE_INFO_TLV_PROTOCOL:
             case TCP_RESTORE_INFO_TLV_USER_DEFINED:
                 break;
 

@@ -100,7 +100,8 @@ static int __fd_send_to_tfe_userspace(struct socket * un_sock,
 
     struct cmsghdr *cmsgp;
     struct msghdr msgh;
-    int result;
+    int result = 0;
+    int retried = 0;
 
     struct kvec iv;
     iv.iov_base = (void *)msg;
@@ -122,7 +123,24 @@ static int __fd_send_to_tfe_userspace(struct socket * un_sock,
     ((int *) CMSG_DATA(cmsgp))[0] = fd_server;
     ((int *) CMSG_DATA(cmsgp))[1] = fd_client;
 
+
+_retry:
     result = kernel_sendmsg(un_sock, &msgh, &iv, 1, msglen);
+    if(unlikely(result == -ENOTCONN && retried == 0))
+    {
+        result = kernel_connect(un_sock, (struct sockaddr *) &g_tfe_kmod_instance->sk_scm_socket_path, 
+                sizeof(g_tfe_kmod_instance->sk_scm_socket_path), 0);
+
+        if(unlikely(result < 0))
+        {
+            pr_err("retry to connect to scm_socket %s err, result = %d\n", 
+                    g_tfe_kmod_instance->sk_scm_socket_path.sun_path, result);
+        }
+
+        retried = 1;
+        goto _retry;
+    }
+
     if(unlikely(result < 0))
     {
         pr_err("Failed at sendmsg to scm unix domain socket, result = %d\n", result);
@@ -520,13 +538,11 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
 
     /* Remove cmsg from clienthello, trim the skb and ip payload length */
 
-#if 0
-    skb_trim(skb, cmsg_payload_len);
+    skb_trim(skb, skb->len - cmsg_payload_len);
     *p_ip_total_len = htons(ntohs(*p_ip_total_len) - cmsg_payload_len);
 
     skb->csum_valid = 1;
     pr_devel("checksum: %d\n", tcp_checksum_complete(skb) ? 1 : 0);
-#endif
 
     /* Create FDs */
     fd_client = __tcp_restore_fd_create(instance->netspace, &__restore_info.client, &__restore_info.server);
@@ -548,7 +564,7 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
         goto errout;
     }
 
-    return NF_DROP;
+    return NF_ACCEPT;
 
 errout:
     if(unlikely(fd_client > 0))
@@ -573,6 +589,7 @@ static int __netfilter_ops_register(struct net * netspace,
     int result = 0;
     
     ops->hook = fn;
+
     ops->hooknum = NF_INET_PRE_ROUTING;
     ops->pf = PF_INET;
     ops->dev = NULL;
@@ -632,12 +649,18 @@ static struct socket * __scm_socket_create(struct net * netspace, const char * p
     }
 
     result = kernel_connect(un_sock, (struct sockaddr *)&un_addr_target, sizeof(un_addr_target), 0);
+    if (unlikely(result == -ENOTCONN))
+    {
+        goto success;
+    }
+
     if (unlikely(result < 0))
     {
         printk(KERN_ERR "Failed at connection unixdomain socket to %s\n", un_addr_target.sun_path);
         goto errout;
     }
 
+success:
     return un_sock;
 
 errout:
