@@ -2,6 +2,7 @@
 #include <linux/kernel.h>
 #include <linux/socket.h>
 #include <linux/skbuff.h>
+#include <linux/kthread.h>
 
 enum tcp_restore_info_tlv_type
 {
@@ -33,8 +34,12 @@ struct tcp_restore_info_endpoint
 
 struct tcp_restore_info
 {
+    struct tfe_kmod_instance * instance;
+    struct kthread_work kthread_work;
     struct tcp_restore_info_endpoint client;
     struct tcp_restore_info_endpoint server;
+    char cmsg[2048];
+    unsigned int cmsg_len;
 };
 
 struct tcp_restore_info_tlv

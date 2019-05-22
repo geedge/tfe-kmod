@@ -1,12 +1,12 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/kthread.h>
 #include <linux/netfilter.h>
 #include <linux/if.h>
 #include <linux/net.h>
 #include <linux/skbuff.h>
 #include <linux/if_ether.h>
-#include <net/ip.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/tcp.h>
@@ -14,6 +14,9 @@
 #include <linux/un.h>
 #include <linux/syscalls.h>
 #include <linux/version.h>
+#include <net/inet_hashtables.h>
+#include <net/ip.h>
+#include <net/tcp.h>
 
 #include "cmsg.h"
 
@@ -49,6 +52,9 @@ struct tfe_kmod_instance
     struct nf_hook_ops nf_hook_ops_bfd_input;
     struct net_device * netdev_cmsg_input;
     struct net_device * netdev_bfd_input;
+
+    /* workqueue */
+    struct kthread_worker * k_worker;
 };
 
 static char * ifname_cmsg = "lo";
@@ -396,9 +402,76 @@ static bool tcp_find_option(uint8_t option, const struct sk_buff *skb,
     return false;
 }
 
-static inline bool tcp_checksum_complete(struct sk_buff *skb)
+void tfe_kernel_tcp_restore_wkqueue_entry(struct kthread_work * wk)
 {
-    return !skb_csum_unnecessary(skb) && __skb_checksum_complete(skb);
+    struct tcp_restore_info * restore_info = container_of(wk, struct tcp_restore_info, kthread_work);
+    struct tfe_kmod_instance * instance = restore_info->instance;
+
+    int fd_client = 0;
+    int fd_server = 0;
+    int result = 0;
+
+    /* Create FDs */
+    fd_client = __tcp_restore_fd_create(instance->netspace, &restore_info->client, &restore_info->server);
+    if(unlikely(fd_client < 0))
+    {
+        goto errout;
+    }
+
+    fd_server = __tcp_restore_fd_create(instance->netspace, &restore_info->server, &restore_info->client);
+    if(unlikely(fd_server < 0))
+    {
+        goto errout;
+    }
+
+    /* Send FDs to userspace application */
+    result = __fd_send_to_tfe_userspace(instance->scm_socket, fd_client, fd_server, 
+            restore_info->cmsg, restore_info->cmsg_len);
+
+    if(unlikely(result < 0))
+    {
+        goto errout;
+    }
+
+    pr_debug("workqueue process done:\n");
+    tcp_restore_info_dump_to_log(restore_info);
+    goto out;
+
+errout:
+    pr_debug("workqueue error, result = %d\n", result);
+    goto out;
+
+out:
+    kfree(restore_info);
+    return;
+}
+
+
+static bool __has_cmsg_repeat_tag(const struct sk_buff * skb)
+{
+    const char * mark_in_char = (const char *)&skb->mark;
+    return mark_in_char[0] == 0x4d && mark_in_char[1] == 0x5a;
+}
+
+static void __set_cmsg_repeat_tag(struct sk_buff * skb)
+{
+    char * mark_in_char = (char *)&skb->mark;
+    mark_in_char[0] = 0x4d;
+    mark_in_char[1] = 0x5a;
+    mark_in_char[2] = 4;
+    mark_in_char[3] = 0;
+}
+
+static bool __is_cmsg_exceed_ttl(struct sk_buff * skb)
+{
+    char * mark_in_char = (char *)&skb->mark;
+    return !!(mark_in_char[2] == 0);
+}
+
+static void __set_cmsg_decrase_ttl(struct sk_buff * skb)
+{
+    char * mark_in_char = (char *)&skb->mark;
+    mark_in_char[2]--;
 }
 
 unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
@@ -410,6 +483,8 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
 
     /* IP total len */
     uint16_t * p_ip_total_len;
+    struct iphdr * ip_hdr = NULL;
+    struct ipv6hdr * ipv6_hdr = NULL;
 
     /* TCP header */
     struct tcphdr _tcp_hdr;
@@ -427,13 +502,9 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
     unsigned int cmsg_payload_len;
 
     /* Restore info */
-    struct tcp_restore_info __restore_info;
+    struct tcp_restore_info * restore_info = NULL;
     /* Result */
-    int result;
-
-    /* FDs */
-    int fd_client = 0;
-    int fd_server = 0;
+    int result = 0;
 
     instance = (struct tfe_kmod_instance *)priv;
     BUG_ON(instance == NULL || instance->netspace == NULL);
@@ -443,10 +514,15 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
         goto not_mine;
     }
 
+    /* The cmsg is re-entry again or not, if the cmsg entry again, check the ttl */
+    if(__has_cmsg_repeat_tag(skb) && __is_cmsg_exceed_ttl(skb))
+    {
+        return NF_DROP;
+    }
+
     if(skb->protocol == htons(ETH_P_IP))
     {
         struct iphdr _ip_hdr;
-        struct iphdr * ip_hdr;
         ip_hdr = skb_header_pointer(skb, skb_network_offset(skb), sizeof(_ip_hdr), &_ip_hdr);
 
         /* Not continous at IP header, or not TCP protocol, ignore it */
@@ -460,8 +536,6 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
     else if(skb->protocol == htons(ETH_P_IPV6))
     {
         struct ipv6hdr _ipv6_hdr;
-        struct ipv6hdr * ipv6_hdr;
-
         ipv6_hdr = skb_header_pointer(skb, skb_network_offset(skb), sizeof(_ipv6_hdr), &_ipv6_hdr);
 
         /* Not continous at IPv6 header, or not TCP protocol, ignore it */
@@ -495,15 +569,39 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
         goto not_mine;
     }
 
+    restore_tcpopt_value = ntohs(restore_tcpopt_value);
+
+    /* If the cmsg is re-entryed, check if the socket has been created by looking up 
+     * the tcp connection table. if not, make the cmsg re-entry the function */
+
+    if(__has_cmsg_repeat_tag(skb) && skb->protocol == ntohs(ETH_P_IP))
+    {
+        struct sock * sk_lookup = inet_lookup_established(instance->netspace, &tcp_hashinfo, 
+                ip_hdr->saddr, tcp_hdr->source, ip_hdr->daddr, tcp_hdr->dest, 0);
+
+        if(sk_lookup == NULL)
+        {
+            __set_cmsg_decrase_ttl(skb);
+            return NF_REPEAT;
+        }
+        else
+        {
+            sock_put(sk_lookup);
+            return NF_ACCEPT;
+        }
+    }
+    else if(__has_cmsg_repeat_tag(skb) && skb->protocol == ntohs(ETH_P_IPV6))
+    {
+        BUG();        
+    }
+
     /* TCPOPT match, linearize the skb */
     if(unlikely(skb_linearize(skb) < 0))
     {
         goto errout;
     }
 
-    restore_tcpopt_value = ntohs(restore_tcpopt_value);
-
-    /* recheck */
+    /* Begin to construct restore information, only happends on cmsg arrivals at first time */
     BUG_ON(!(skb_transport_header(skb) != NULL));
     BUG_ON(!(skb->len >= (skb_transport_offset(skb) + tcp_hdr_len)));
 
@@ -511,76 +609,83 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
     tcp_payload = skb_transport_header(skb) + tcp_hdr_len;
     tcp_payload_len = skb->len - skb_transport_offset(skb) - tcp_hdr_len;
 
-    pr_devel("tcp_payload_len=%u, restore_tcpopt_value=%u\n", tcp_payload_len, restore_tcpopt_value);
-
     /* Cmsg */
     BUG_ON(tcp_payload_len < restore_tcpopt_value);
     cmsg_payload = tcp_payload + restore_tcpopt_value;
     cmsg_payload_len = tcp_payload_len - restore_tcpopt_value;
 
-    pr_devel("cmsg_payload=%p, cmsg_payload_len=%u\n", cmsg_payload, cmsg_payload_len);
+    restore_info = (struct tcp_restore_info *)kmalloc(sizeof(struct tcp_restore_info), GFP_ATOMIC);
+    if(unlikely(restore_info == NULL))
+    {
+        pr_err("Failed at alloc memory for restore info, drop it.\n");
+        goto errout;
+    }
+
+    /* Init the restore info */
+    kthread_init_work(&restore_info->kthread_work, tfe_kernel_tcp_restore_wkqueue_entry);
+    restore_info->instance = instance;
 
     /* Construct restore info from packet */
-    result = tcp_restore_info_parse_from_skb(skb, &__restore_info);
+    result = tcp_restore_info_parse_from_skb(skb, restore_info);
     if(unlikely(result < 0))
     {
         goto errout;
     }
 
     /* ClientHello with leader */
-    result = tcp_restore_info_parse_from_cmsg(cmsg_payload, cmsg_payload_len, &__restore_info);
+    result = tcp_restore_info_parse_from_cmsg(cmsg_payload, cmsg_payload_len, restore_info);
     if(unlikely(result < 0))
     {
         goto errout;
     }
-
-    tcp_restore_info_dump_to_log(&__restore_info);
 
     /* Remove cmsg from clienthello, trim the skb and ip payload length */
-
     skb_trim(skb, skb->len - cmsg_payload_len);
     *p_ip_total_len = htons(ntohs(*p_ip_total_len) - cmsg_payload_len);
-
     skb->csum_valid = 1;
-    pr_devel("checksum: %d\n", tcp_checksum_complete(skb) ? 1 : 0);
 
-    /* Create FDs */
-    fd_client = __tcp_restore_fd_create(instance->netspace, &__restore_info.client, &__restore_info.server);
-    if(unlikely(fd_client < 0))
-    {
-        goto errout;
-    }
+    /* Defer the tcp restore workload, and make the cmsg re-entry the hook again */
+    tcp_restore_info_dump_to_log(restore_info);
+    kthread_queue_work(instance->k_worker, &restore_info->kthread_work);
 
-    fd_server = __tcp_restore_fd_create(instance->netspace, &__restore_info.server, &__restore_info.client);
-    if(unlikely(fd_server < 0))
-    {
-        goto errout;
-    }
-
-    /* Send FDs to userspace application */
-    result = __fd_send_to_tfe_userspace(instance->scm_socket, fd_client, fd_server, cmsg_payload, cmsg_payload_len);
-    if(unlikely(result < 0))
-    {
-        goto errout;
-    }
-
-    return NF_ACCEPT;
+    /* Set the skb with cmsg tag */
+    __set_cmsg_repeat_tag(skb);
+    return NF_REPEAT;
 
 errout:
-    if(unlikely(fd_client > 0))
+    if(restore_info != NULL)
     {
-        __call_sys_close(fd_client);
-    }
-
-    if(unlikely(fd_server > 0))
-    {
-        __call_sys_close(fd_server);
+        kfree(restore_info);
     }
 
     return NF_ACCEPT;
 
 not_mine:
     return NF_ACCEPT;
+}
+
+static int __rlimit_fs(struct task_struct *tsk, unsigned int fs_limit)
+{
+	int retval = 0;
+	if (fs_limit > 65536)
+    {
+        return -EPERM;
+	}
+
+	/* protect tsk->signal and tsk->sighand from disappearing */
+	if (!tsk->sighand)
+    {
+		retval = -ESRCH;
+		goto out;
+	}
+
+	task_lock(tsk->group_leader);
+    tsk->signal->rlim[RLIMIT_NOFILE].rlim_cur = fs_limit;
+    tsk->signal->rlim[RLIMIT_NOFILE].rlim_max = fs_limit;
+	task_unlock(tsk->group_leader);
+
+out:
+	return retval;
 }
 
 static int __netfilter_ops_register(struct net * netspace, 
@@ -695,6 +800,11 @@ static int tfe_kmod_instance_deinit(struct tfe_kmod_instance * instance)
         dev_put(instance->netdev_cmsg_input);
     }
 
+    if(instance->k_worker)
+    {
+        kthread_destroy_worker(instance->k_worker);
+    }
+
     return 0;
 }
 
@@ -728,6 +838,20 @@ static int tfe_kmod_instance_init(struct tfe_kmod_instance * instance)
     if (result < 0)
     {
         pr_err("Failed at register netfilter for cmsg at interface %s\n", instance->ifname_cmsg_input);
+        goto errout;
+    }
+
+    instance->k_worker = kthread_create_worker(0, "tfe-tcp-restore");
+    if(IS_ERR(instance->k_worker))
+    {
+        pr_err("Failed at creating kthread worker for tcp restore, result = %ld\n", PTR_ERR(instance->k_worker));
+        instance->k_worker = NULL; goto errout;
+    }
+
+    result = __rlimit_fs(instance->k_worker->task, 65535);
+    if(result < 0)
+    {
+        pr_err("Failed at set NOFILE limit for kthread worker, result = %d\n", result);
         goto errout;
     }
 

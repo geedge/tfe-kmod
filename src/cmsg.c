@@ -105,9 +105,12 @@ int tcp_restore_info_parse_from_cmsg(const char * data, unsigned int datalen, st
         goto invalid_format;
     }
 
+    memcpy(out->cmsg, data, datalen);
+    out->cmsg_len = datalen;
+
     datalen -= sizeof(struct tcp_restore_info_header);
     data += sizeof(struct tcp_restore_info_header);
-
+    
     for(tlv_iter = 0; tlv_iter < nr_tlvs; tlv_iter++)
     {
         struct tcp_restore_info_tlv * tlv = (struct tcp_restore_info_tlv *)data;
@@ -202,7 +205,7 @@ int tcp_restore_info_parse_from_cmsg(const char * data, unsigned int datalen, st
         datalen -= __length;
     }
 
-    return 0;
+   return 0;
 
 invalid_format:
     pr_err("cmsg parser fail!\n");
