@@ -1,5 +1,5 @@
 obj-m += tfe_kmod_core.o
-tfe_kmod_core-y := src/core.o src/util.o src/proc.o src/cmsg.o
+tfe_kmod_core-y := src/core.o src/util.o src/stat.o src/cmsg.o
 ccflags-y := -DDEBUG -g
 
 all:

@@ -19,6 +19,7 @@
 #include <net/tcp.h>
 
 #include "cmsg.h"
+#include "stat.h"
 
 #ifndef TFE_KMOD_VERSION
 #define TFE_KMOD_VERSION 	"Unknown"
@@ -55,6 +56,9 @@ struct tfe_kmod_instance
 
     /* workqueue */
     struct kthread_worker * k_worker;
+
+    /* Stat */
+    struct tfe_kmod_stat * stat;
 };
 
 static char * ifname_cmsg = "lo";
@@ -107,15 +111,14 @@ static int __fd_send_to_tfe_userspace(struct socket * un_sock,
     struct cmsghdr *cmsgp;
     struct msghdr msgh;
     int result = 0;
-    int retried = 0;
 
     struct kvec iv;
     iv.iov_base = (void *)msg;
     iv.iov_len = msglen;
   
     memset(&msgh, 0, sizeof(msgh));
-    msgh.msg_name = NULL;
-    msgh.msg_namelen = 0;
+    msgh.msg_name = &g_tfe_kmod_instance->sk_scm_socket_path;
+    msgh.msg_namelen = sizeof(g_tfe_kmod_instance->sk_scm_socket_path);
     msgh.msg_control = controlMsg.buf;
     msgh.msg_controllen = sizeof(controlMsg.buf);
     msgh.msg_flags = MSG_DONTWAIT;
@@ -129,24 +132,7 @@ static int __fd_send_to_tfe_userspace(struct socket * un_sock,
     ((int *) CMSG_DATA(cmsgp))[0] = fd_server;
     ((int *) CMSG_DATA(cmsgp))[1] = fd_client;
 
-
-_retry:
     result = kernel_sendmsg(un_sock, &msgh, &iv, 1, msglen);
-    if(unlikely(result == -ENOTCONN && retried == 0))
-    {
-        result = kernel_connect(un_sock, (struct sockaddr *) &g_tfe_kmod_instance->sk_scm_socket_path, 
-                sizeof(g_tfe_kmod_instance->sk_scm_socket_path), 0);
-
-        if(unlikely(result < 0))
-        {
-            pr_err("retry to connect to scm_socket %s err, result = %d\n", 
-                    g_tfe_kmod_instance->sk_scm_socket_path.sun_path, result);
-        }
-
-        retried = 1;
-        goto _retry;
-    }
-
     if(unlikely(result < 0))
     {
         pr_err("Failed at sendmsg to scm unix domain socket, result = %d\n", result);
@@ -155,7 +141,6 @@ _retry:
 
     __call_sys_close(fd_client);
     __call_sys_close(fd_server);
-
     return result;
 }
 
@@ -350,8 +335,6 @@ static bool tcp_find_option(uint8_t option, const struct sk_buff *skb,
     uint8_t _opt[60 - sizeof(struct tcphdr)];
     unsigned int i;
 
-    pr_debug("skb=%p, protooff=%u, optlen=%u\n", skb, protoff, optlen);
-
     if (!optlen)
         return false;
 
@@ -430,10 +413,10 @@ void tfe_kernel_tcp_restore_wkqueue_entry(struct kthread_work * wk)
 
     if(unlikely(result < 0))
     {
-        goto errout;
+        __call_sys_close(fd_client);
+        __call_sys_close(fd_server);
     }
 
-    pr_debug("workqueue process done:\n");
     tcp_restore_info_dump_to_log(restore_info);
     goto out;
 
@@ -852,6 +835,13 @@ static int tfe_kmod_instance_init(struct tfe_kmod_instance * instance)
     if(result < 0)
     {
         pr_err("Failed at set NOFILE limit for kthread worker, result = %d\n", result);
+        goto errout;
+    }
+
+    instance->stat = tfe_kmod_stat_create(instance->netspace);
+    if(!instance->stat)
+    {
+        pr_err("Failed at creating stat handler.\n");
         goto errout;
     }
 
