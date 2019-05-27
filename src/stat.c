@@ -11,18 +11,6 @@
 #define TFE_KMOD_PROC_DIR "tfe"
 #endif
 
-enum tfe_kmod_stat_item
-{
-    /* netfilter return value */
-    TFE_KMOD_STAT_NF_HOOK_INPUT,
-    TFE_KMOD_STAT_NF_HOOK_ACCEPT,
-    TFE_KMOD_STAT_NF_HOOK_DROP,
-    TFE_KMOD_STAT_NF_HOOK_REPEAT,
-
-    /* Max */
-    TFE_KMOD_STAT_MAX
-};
-
 static const char * str_stat_entry[] = 
 {
     [TFE_KMOD_STAT_NF_HOOK_INPUT] = "NfHookInput",
@@ -104,9 +92,17 @@ errout:
     return NULL;
 }
 
+
+void tfe_kmod_stat_add(struct tfe_kmod_stat * handle, enum tfe_kmod_stat_item st_item, unsigned int value)
+{
+    BUG_ON(st_item >= TFE_KMOD_STAT_MAX);
+    atomic64_add(value, &handle->stat[st_item]);
+    return;
+}
+
 void tfe_kmod_stat_destroy(struct tfe_kmod_stat * stat)
 {
-    remove_proc_entry("stat", stat->proc_stat_entry);
-    remove_proc_entry(TFE_KMOD_PROC_DIR, stat->proc_dir);
+    remove_proc_entry("stat", stat->proc_dir);
+    remove_proc_entry(TFE_KMOD_PROC_DIR, NULL);
     kfree(stat);
 }

@@ -14,9 +14,11 @@
 #include <linux/un.h>
 #include <linux/syscalls.h>
 #include <linux/version.h>
-#include <net/inet_hashtables.h>
+
 #include <net/ip.h>
 #include <net/tcp.h>
+#include <net/netfilter/nf_queue.h>
+#include <net/inet_hashtables.h>
 
 #include "cmsg.h"
 #include "stat.h"
@@ -133,7 +135,11 @@ static int __fd_send_to_tfe_userspace(struct socket * un_sock,
     ((int *) CMSG_DATA(cmsgp))[1] = fd_client;
 
     result = kernel_sendmsg(un_sock, &msgh, &iv, 1, msglen);
-    if(unlikely(result < 0))
+    if(unlikely(result < 0) && (result == -ECONNREFUSED || result == -ENOENT))
+    {
+        return result;
+    }
+    else if(unlikely(result < 0))
     {
         pr_err("Failed at sendmsg to scm unix domain socket, result = %d\n", result);
         return result;
@@ -141,6 +147,7 @@ static int __fd_send_to_tfe_userspace(struct socket * un_sock,
 
     __call_sys_close(fd_client);
     __call_sys_close(fd_server);
+
     return result;
 }
 
@@ -413,14 +420,25 @@ void tfe_kernel_tcp_restore_wkqueue_entry(struct kthread_work * wk)
 
     if(unlikely(result < 0))
     {
-        __call_sys_close(fd_client);
-        __call_sys_close(fd_server);
+        goto errout;
     }
 
     tcp_restore_info_dump_to_log(restore_info);
+    nf_reinject(restore_info->nf_queue_entry, NF_ACCEPT);
+
     goto out;
 
 errout:
+    if(unlikely(fd_client != 0))
+    {
+        __call_sys_close(fd_client);
+    }
+
+    if(unlikely(fd_server != 0))
+    {
+        __call_sys_close(fd_server);
+    }
+
     pr_debug("workqueue error, result = %d\n", result);
     goto out;
 
@@ -429,160 +447,81 @@ out:
     return;
 }
 
-
-static bool __has_cmsg_repeat_tag(const struct sk_buff * skb)
+union __cmsg_so_mark
 {
-    const char * mark_in_char = (const char *)&skb->mark;
-    return mark_in_char[0] == 0x4d && mark_in_char[1] == 0x5a;
+    __u32 mark_value;
+    struct
+    {
+        char magic[2];
+        __u16 offset;
+    } mark_struct;
+};
+
+static bool __is_cmsg_by_mark(const struct sk_buff * skb)
+{
+    union __cmsg_so_mark * mark = (union __cmsg_so_mark *)&skb->mark;
+    return !!(mark->mark_struct.magic[0] == 0x4d && mark->mark_struct.magic[1] == 0x5a);
 }
 
-static void __set_cmsg_repeat_tag(struct sk_buff * skb)
+static void __set_cmsg_by_mark(struct sk_buff * skb, uint16_t cmsg_offset)
 {
-    char * mark_in_char = (char *)&skb->mark;
-    mark_in_char[0] = 0x4d;
-    mark_in_char[1] = 0x5a;
-    mark_in_char[2] = 4;
-    mark_in_char[3] = 0;
+    union __cmsg_so_mark * mark = (union __cmsg_so_mark *)&skb->mark;
+    mark->mark_struct.magic[0] = 0x4d;
+    mark->mark_struct.magic[1] = 0x5a;
+    mark->mark_struct.offset = cmsg_offset;
 }
 
-static bool __is_cmsg_exceed_ttl(struct sk_buff * skb)
+static bool __get_cmsg_by_mark(struct sk_buff * skb, uint16_t * cmsg_offset)
 {
-    char * mark_in_char = (char *)&skb->mark;
-    return !!(mark_in_char[2] == 0);
+    union __cmsg_so_mark * mark = (union __cmsg_so_mark *)&skb->mark;
+    if(__is_cmsg_by_mark(skb))
+    {
+        *cmsg_offset = mark->mark_struct.offset;
+        return true;
+    }
+
+    return false;
 }
 
-static void __set_cmsg_decrase_ttl(struct sk_buff * skb)
+static void tfe_kernel_tcp_queue_hook_drop(struct net * net)
 {
-    char * mark_in_char = (char *)&skb->mark;
-    mark_in_char[2]--;
+    return;
 }
 
-unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
+int tfe_kernel_tcp_queue_outfn(struct nf_queue_entry *entry, unsigned int queuenum)
 {
-    /* Filter ClientHello from all incoming packets,
-    * ClientHello may exist in all TCP packets */
+    struct sk_buff * skb = entry->skb;
+    struct tfe_kmod_instance * instance = g_tfe_kmod_instance;
 
-    struct tfe_kmod_instance * instance;
-
-    /* IP total len */
-    uint16_t * p_ip_total_len;
-    struct iphdr * ip_hdr = NULL;
-    struct ipv6hdr * ipv6_hdr = NULL;
-
-    /* TCP header */
     struct tcphdr _tcp_hdr;
     struct tcphdr * tcp_hdr;
     unsigned int tcp_hdr_len;
 
-    /* TCP Options */
-    uint16_t restore_tcpopt_value;
-    uint8_t restore_tcpopt_length;
-    bool is_hit_tcpopt;
-
     const uint8_t * tcp_payload;
     unsigned int tcp_payload_len;
+
     const uint8_t * cmsg_payload;
     unsigned int cmsg_payload_len;
 
     /* Restore info */
     struct tcp_restore_info * restore_info = NULL;
+
+	 /* TCP Options */
+    uint16_t cmsg_offset;
+
     /* Result */
     int result = 0;
-
-    instance = (struct tfe_kmod_instance *)priv;
-    BUG_ON(instance == NULL || instance->netspace == NULL);
-
-    if(state->in->ifindex != instance->netdev_cmsg_input->ifindex)
-    {
-        goto not_mine;
-    }
-
-    /* The cmsg is re-entry again or not, if the cmsg entry again, check the ttl */
-    if(__has_cmsg_repeat_tag(skb) && __is_cmsg_exceed_ttl(skb))
-    {
-        return NF_DROP;
-    }
-
-    if(skb->protocol == htons(ETH_P_IP))
-    {
-        struct iphdr _ip_hdr;
-        ip_hdr = skb_header_pointer(skb, skb_network_offset(skb), sizeof(_ip_hdr), &_ip_hdr);
-
-        /* Not continous at IP header, or not TCP protocol, ignore it */
-        if (!ip_hdr || ip_hdr->version != 4 || ip_hdr->protocol != IPPROTO_TCP)
-        {
-            goto not_mine;
-        }
-
-        p_ip_total_len = &ip_hdr->tot_len;
-    }
-    else if(skb->protocol == htons(ETH_P_IPV6))
-    {
-        struct ipv6hdr _ipv6_hdr;
-        ipv6_hdr = skb_header_pointer(skb, skb_network_offset(skb), sizeof(_ipv6_hdr), &_ipv6_hdr);
-
-        /* Not continous at IPv6 header, or not TCP protocol, ignore it */
-        if (!ipv6_hdr || ipv6_hdr->version != 6 || ipv6_hdr->nexthdr != IPPROTO_TCP)
-        {
-            goto not_mine;
-        }
-
-        p_ip_total_len = &ipv6_hdr->payload_len;
-    }
-    else
-    {
-        goto not_mine;
-    }
-
-    tcp_hdr = skb_header_pointer(skb, skb_transport_offset(skb), sizeof(_tcp_hdr), &_tcp_hdr);
-    tcp_hdr_len = tcp_hdr->doff * 4;
-
-    /* Check if there is a tcp options */
-    if(!tcp_hdr || tcp_hdr_len <= sizeof(struct tcphdr))
-    {
-        goto not_mine;
-    }
-
-    is_hit_tcpopt = tcp_find_option(TCP_RESTORE_TCPOPT_KIND, skb, skb_transport_offset(skb),
-            tcp_hdr_len - sizeof(struct tcphdr), &restore_tcpopt_length, 
-            (char *)&restore_tcpopt_value, sizeof(restore_tcpopt_value));
-
-    if(!is_hit_tcpopt || restore_tcpopt_length != 2)
-    {
-        goto not_mine;
-    }
-
-    restore_tcpopt_value = ntohs(restore_tcpopt_value);
-
-    /* If the cmsg is re-entryed, check if the socket has been created by looking up 
-     * the tcp connection table. if not, make the cmsg re-entry the function */
-
-    if(__has_cmsg_repeat_tag(skb) && skb->protocol == ntohs(ETH_P_IP))
-    {
-        struct sock * sk_lookup = inet_lookup_established(instance->netspace, &tcp_hashinfo, 
-                ip_hdr->saddr, tcp_hdr->source, ip_hdr->daddr, tcp_hdr->dest, 0);
-
-        if(sk_lookup == NULL)
-        {
-            __set_cmsg_decrase_ttl(skb);
-            return NF_REPEAT;
-        }
-        else
-        {
-            sock_put(sk_lookup);
-            return NF_ACCEPT;
-        }
-    }
-    else if(__has_cmsg_repeat_tag(skb) && skb->protocol == ntohs(ETH_P_IPV6))
-    {
-        BUG();        
-    }
-
-    /* TCPOPT match, linearize the skb */
-    if(unlikely(skb_linearize(skb) < 0))
+    if(!__get_cmsg_by_mark(skb, &cmsg_offset))
     {
         goto errout;
     }
+
+    skb_linearize(skb);
+    pr_devel("cmsg_offset = %u\n", cmsg_offset);
+
+	/* TCP Header */
+    tcp_hdr = skb_header_pointer(skb, skb_transport_offset(skb), sizeof(_tcp_hdr), &_tcp_hdr);
+    tcp_hdr_len = tcp_hdr->doff * 4;
 
     /* Begin to construct restore information, only happends on cmsg arrivals at first time */
     BUG_ON(!(skb_transport_header(skb) != NULL));
@@ -593,9 +532,9 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
     tcp_payload_len = skb->len - skb_transport_offset(skb) - tcp_hdr_len;
 
     /* Cmsg */
-    BUG_ON(tcp_payload_len < restore_tcpopt_value);
-    cmsg_payload = tcp_payload + restore_tcpopt_value;
-    cmsg_payload_len = tcp_payload_len - restore_tcpopt_value;
+    BUG_ON(tcp_payload_len < cmsg_offset);
+    cmsg_payload = tcp_payload + cmsg_offset;
+    cmsg_payload_len = tcp_payload_len - cmsg_offset;
 
     restore_info = (struct tcp_restore_info *)kmalloc(sizeof(struct tcp_restore_info), GFP_ATOMIC);
     if(unlikely(restore_info == NULL))
@@ -606,7 +545,8 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
 
     /* Init the restore info */
     kthread_init_work(&restore_info->kthread_work, tfe_kernel_tcp_restore_wkqueue_entry);
-    restore_info->instance = instance;
+    restore_info->instance = g_tfe_kmod_instance;
+    restore_info->nf_queue_entry = entry;
 
     /* Construct restore info from packet */
     result = tcp_restore_info_parse_from_skb(skb, restore_info);
@@ -624,25 +564,114 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
 
     /* Remove cmsg from clienthello, trim the skb and ip payload length */
     skb_trim(skb, skb->len - cmsg_payload_len);
-    *p_ip_total_len = htons(ntohs(*p_ip_total_len) - cmsg_payload_len);
+    if(skb->protocol == ntohs(ETH_P_IP))
+    {
+        struct iphdr * p_ip_hdr = ip_hdr(skb);
+        p_ip_hdr->tot_len = htons(ntohs(p_ip_hdr->tot_len) - cmsg_payload_len);
+    }
+    else if(skb->protocol == ntohs(ETH_P_IPV6))
+    {
+        struct ipv6hdr * p_ipv6_hdr = ipv6_hdr(skb);
+        p_ipv6_hdr->payload_len = htons(ntohs(p_ipv6_hdr->payload_len) - cmsg_payload_len);
+    }
+
     skb->csum_valid = 1;
 
-    /* Defer the tcp restore workload, and make the cmsg re-entry the hook again */
+    /* Defer the tcp restore workload to kthread */
     tcp_restore_info_dump_to_log(restore_info);
     kthread_queue_work(instance->k_worker, &restore_info->kthread_work);
 
-    /* Set the skb with cmsg tag */
-    __set_cmsg_repeat_tag(skb);
-    return NF_REPEAT;
+    /* success, entry will be free in kthread_work */
+    return 0;
 
 errout:
-    if(restore_info != NULL)
+    return -ENOBUFS;
+}
+
+unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
+{
+    /* Filter ClientHello from all incoming packets,
+    * ClientHello may exist in all TCP packets */
+
+    struct tfe_kmod_instance * instance;
+    struct iphdr * ip_hdr = NULL;
+    struct ipv6hdr * ipv6_hdr = NULL;
+
+    /* TCP header */
+    struct tcphdr _tcp_hdr;
+    struct tcphdr * tcp_hdr;
+    unsigned int tcp_hdr_len;
+
+    /* TCP Options */
+    uint8_t restore_tcpopt_length;
+    bool is_hit_tcpopt;
+    uint16_t cmsg_offset;
+
+    instance = (struct tfe_kmod_instance *)priv;
+    BUG_ON(instance == NULL || instance->netspace == NULL);
+
+    if(state->in->ifindex != instance->netdev_cmsg_input->ifindex)
     {
-        kfree(restore_info);
+        goto not_mine;
     }
 
-    return NF_ACCEPT;
+    if(skb->protocol == htons(ETH_P_IP))
+    {
+        struct iphdr _ip_hdr;
+        ip_hdr = skb_header_pointer(skb, skb_network_offset(skb), sizeof(_ip_hdr), &_ip_hdr);
 
+        /* Not continous at IP header, or not TCP protocol, ignore it */
+        if (!ip_hdr || ip_hdr->version != 4 || ip_hdr->protocol != IPPROTO_TCP)
+        {
+            goto not_mine;
+        }
+    }
+    else if(skb->protocol == htons(ETH_P_IPV6))
+    {
+        struct ipv6hdr _ipv6_hdr;
+        ipv6_hdr = skb_header_pointer(skb, skb_network_offset(skb), sizeof(_ipv6_hdr), &_ipv6_hdr);
+
+        /* Not continous at IPv6 header, or not TCP protocol, ignore it */
+        if (!ipv6_hdr || ipv6_hdr->version != 6 || ipv6_hdr->nexthdr != IPPROTO_TCP)
+        {
+            goto not_mine;
+        }
+    }
+    else
+    {
+        goto not_mine;
+    }
+
+    tcp_hdr = skb_header_pointer(skb, skb_transport_offset(skb), sizeof(_tcp_hdr), &_tcp_hdr);
+    tcp_hdr_len = tcp_hdr->doff * 4;
+
+    /* Check if there is a tcp options */
+    if(!tcp_hdr || tcp_hdr_len <= sizeof(struct tcphdr))
+    {
+        goto not_mine;
+    }
+
+    is_hit_tcpopt = tcp_find_option(TCP_RESTORE_TCPOPT_KIND, skb, skb_transport_offset(skb),
+            tcp_hdr_len - sizeof(struct tcphdr), &restore_tcpopt_length, 
+            (char *)&cmsg_offset, sizeof(cmsg_offset));
+
+    if(!is_hit_tcpopt || restore_tcpopt_length != 2)
+    {
+        goto not_mine;
+    }
+
+    cmsg_offset = ntohs(cmsg_offset);
+
+    /* TCPOPT match, set mark and save cmsg offset */
+    __set_cmsg_by_mark(skb, cmsg_offset);
+
+    /* Stat */
+    tfe_kmod_stat_add(instance->stat, TFE_KMOD_STAT_NF_HOOK_QUEUE, 1);
+    tfe_kmod_stat_add(instance->stat, TFE_KMOD_STAT_CMSG_IN_QUEUE, 1);
+
+    /* defer the skb to queue, handle in tfe_kernel_tcp_queue_outfn() */
+    return NF_QUEUE;
+    
 not_mine:
     return NF_ACCEPT;
 }
@@ -788,8 +817,20 @@ static int tfe_kmod_instance_deinit(struct tfe_kmod_instance * instance)
         kthread_destroy_worker(instance->k_worker);
     }
 
+    if(instance->stat)
+    {
+        tfe_kmod_stat_destroy(instance->stat);
+    }
+
+    nf_unregister_queue_handler(instance->netspace);
     return 0;
 }
+
+static const struct nf_queue_handler tfe_kmod_nfqh = 
+{
+    .outfn= tfe_kernel_tcp_queue_outfn,
+    .nf_hook_drop = tfe_kernel_tcp_queue_hook_drop
+};
 
 static int tfe_kmod_instance_init(struct tfe_kmod_instance * instance)
 {
@@ -845,6 +886,7 @@ static int tfe_kmod_instance_init(struct tfe_kmod_instance * instance)
         goto errout;
     }
 
+    nf_register_queue_handler(instance->netspace, &tfe_kmod_nfqh);
     return 0;
 
 errout:

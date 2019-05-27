@@ -36,8 +36,11 @@ struct tcp_restore_info
 {
     struct tfe_kmod_instance * instance;
     struct kthread_work kthread_work;
+    struct nf_queue_entry * nf_queue_entry;
+
     struct tcp_restore_info_endpoint client;
     struct tcp_restore_info_endpoint server;
+
     char cmsg[2048];
     unsigned int cmsg_len;
 };
