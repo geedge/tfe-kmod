@@ -164,6 +164,9 @@ static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_resto
     struct tcp_repair_opt tcp_repair_opts[8];
     unsigned int nr_tcp_repair_opts = 0;
 
+    struct tcp_repair_window tcp_repair_window;
+    memset(&tcp_repair_window, 0, sizeof(struct tcp_repair_window));
+
     result = sock_create_kern(netspace, AF_INET, SOCK_STREAM, IPPROTO_TCP, &__sock);
     if (unlikely(result < 0))
     {
@@ -289,6 +292,25 @@ static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_resto
         printk(KERN_ERR "Failed at setsockopt(TCP_REPAIR_OPTIONS), result = %d\n", result);
         goto errout;
     }
+
+#if 0
+    /* Perpare Window Setup */
+    tcp_repair_window.snd_wl1 = peer->seq;
+    tcp_repair_window.snd_wnd = peer->window;
+    tcp_repair_window.max_window = peer->window;
+
+    tcp_repair_window.rcv_wnd = endpoint->window;
+    tcp_repair_window.rcv_wup = endpoint->ack;
+
+    result = kernel_setsockopt(__sock, SOL_TCP, TCP_REPAIR_WINDOW, (char *)&tcp_repair_window,
+            sizeof(tcp_repair_window));
+
+    if (unlikely(result < 0))
+    {
+        printk(KERN_ERR "Failed at setsockopt(TCP_REPAIR_WINDOW), result = %d\n", result);
+        goto errout;
+    }
+#endif
 
     sockopt = 0;
     result = kernel_setsockopt(__sock, SOL_TCP, TCP_REPAIR, (char *)&sockopt, sizeof(sockopt));
@@ -765,6 +787,7 @@ static struct socket * __scm_socket_create(struct net * netspace, const char * p
         goto errout;
     }
 
+#if 0
     result = kernel_connect(un_sock, (struct sockaddr *)&un_addr_target, sizeof(un_addr_target), 0);
     if (unlikely(result == -ENOTCONN))
     {
@@ -776,8 +799,8 @@ static struct socket * __scm_socket_create(struct net * netspace, const char * p
         printk(KERN_ERR "Failed at connection unixdomain socket to %s\n", un_addr_target.sun_path);
         goto errout;
     }
+#endif
 
-success:
     return un_sock;
 
 errout:

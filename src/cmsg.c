@@ -192,13 +192,18 @@ int tcp_restore_info_parse_from_cmsg(const char * data, unsigned int datalen, st
                 out->server.mss = ntohs(tlv->value_as_uint16[0]);
                 break;
 
-            case TCP_RESTORE_INFO_TLV_PROTOCOL:
-            case TCP_RESTORE_INFO_TLV_USER_DEFINED:
+            case TCP_RESTORE_INFO_WINDOW_CLIENT:
+                __CHECK_TLV_LENGTH(sizeof(uint16_t));
+                out->client.window = ntohs(tlv->value_as_uint16[0]);
+                break;
+
+            case TCP_RESTORE_INFO_WINDOW_SERVER:
+                __CHECK_TLV_LENGTH(sizeof(uint16_t));
+                out->server.window = ntohs(tlv->value_as_uint16[0]);
                 break;
 
             default:
-                printk(KERN_ERR "Invalid restore info format: unsupported type %x, drop it.\n", tlv_type);
-                goto invalid_format;
+                break;
         }
 
         data += __length;
