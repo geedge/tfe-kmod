@@ -6,18 +6,19 @@
 
 enum tcp_restore_info_tlv_type
 {
-    TCP_RESTORE_INFO_TLV_SEQ,
-    TCP_RESTORE_INFO_TLV_ACK,
-    TCP_RESTORE_INFO_TLV_MSS_CLIENT,
-    TCP_RESTORE_INFO_TLV_MSS_SERVER,
-    TCP_RESTORE_INFO_TLV_WSACLE_CLIENT,
-    TCP_RESTORE_INFO_TLV_WSACLE_SERVER,
-    TCP_RESTORE_INFO_TLV_SACK_CLIENT,
-    TCP_RESTORE_INFO_TLV_SACK_SERVER,
-    TCP_RESTORE_INFO_TLV_TS_CLIENT,
-    TCP_RESTORE_INFO_TLV_TS_SERVER,
-    TCP_RESTORE_INFO_TLV_PROTOCOL,
-    TCP_RESTORE_INFO_TLV_USER_DEFINED
+    TCP_RESTORE_INFO_TLV_SEQ = 0x0,
+    TCP_RESTORE_INFO_TLV_ACK = 0x1,
+    TCP_RESTORE_INFO_TLV_MSS_CLIENT = 0x2,
+    TCP_RESTORE_INFO_TLV_MSS_SERVER = 0x3,
+    TCP_RESTORE_INFO_TLV_WSACLE_CLIENT = 0x4,
+    TCP_RESTORE_INFO_TLV_WSACLE_SERVER = 0x5,
+    TCP_RESTORE_INFO_TLV_SACK_CLIENT = 0x6,
+    TCP_RESTORE_INFO_TLV_SACK_SERVER = 0x7,
+    TCP_RESTORE_INFO_TLV_TS_CLIENT = 0x8,
+    TCP_RESTORE_INFO_TLV_TS_SERVER = 0x9,
+    TCP_RESTORE_INFO_TLV_PROTOCOL = 0xa,
+    TCP_RESTORE_INFO_WINDOW_CLIENT = 0xb,
+    TCP_RESTORE_INFO_WINDOW_SERVER = 0xc,
 };
 
 struct tcp_restore_info_endpoint
@@ -29,6 +30,7 @@ struct tcp_restore_info_endpoint
     bool timestamp_perm;
     bool sack_perm;
     uint16_t mss;
+    uint16_t window;
     uint8_t wscale;
 };
 
@@ -36,8 +38,11 @@ struct tcp_restore_info
 {
     struct tfe_kmod_instance * instance;
     struct kthread_work kthread_work;
+    struct nf_queue_entry * nf_queue_entry;
+
     struct tcp_restore_info_endpoint client;
     struct tcp_restore_info_endpoint server;
+
     char cmsg[2048];
     unsigned int cmsg_len;
 };
@@ -66,7 +71,6 @@ struct tcp_restore_info_header
 
 #define TCP_RESTORE_TCPOPT_KIND      88
 #define TCP_RESTORE_TCPOPT_LENGTH    4
-
 
 void tcp_restore_info_dump_to_log(const struct tcp_restore_info * info);
 int tcp_restore_info_parse_from_skb(struct sk_buff * skb, struct tcp_restore_info * out);
