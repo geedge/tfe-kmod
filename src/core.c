@@ -154,12 +154,12 @@ static int __fd_send_to_tfe_userspace(struct socket * un_sock,
 static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_restore_info_endpoint * endpoint, 
         const struct tcp_restore_info_endpoint * peer)
 {
-    struct socket * __sock;
-    struct file * __file;
+    struct socket * __sock = NULL;
+    struct file * __file = NULL;
     int __fd = 0;
 
-    int result;
-    int sockopt;
+    int result = 0;
+    int sockopt = 0;
 
     struct tcp_repair_opt tcp_repair_opts[8];
     unsigned int nr_tcp_repair_opts = 0;
@@ -167,7 +167,20 @@ static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_resto
     struct tcp_repair_window tcp_repair_window;
     memset(&tcp_repair_window, 0, sizeof(struct tcp_repair_window));
 
-    result = sock_create_kern(netspace, AF_INET, SOCK_STREAM, IPPROTO_TCP, &__sock);
+    if (endpoint->addr.ss_family == AF_INET)
+    {
+        result = sock_create_kern(netspace, AF_INET, SOCK_STREAM, IPPROTO_TCP, &__sock);
+    }
+    else if(endpoint->addr.ss_family == AF_INET6)
+    {
+        result = sock_create_kern(netspace, AF_INET6, SOCK_STREAM, IPPROTO_TCP, &__sock);
+    }
+    else
+    {
+        printk(KERN_ERR "Invalid endpoint's ss_family, ss_family = %x\n", endpoint->addr.ss_family);
+        goto errout;
+    }
+
     if (unlikely(result < 0))
     {
         printk(KERN_ERR "Failed at creating client's socket at kern\n");
@@ -730,7 +743,7 @@ static int __netfilter_ops_register(struct net * netspace,
     ops->hook = fn;
 
     ops->hooknum = NF_INET_PRE_ROUTING;
-    ops->pf = PF_INET;
+    ops->pf = NFPROTO_INET;
     ops->dev = NULL;
     ops->priv = arg;
 
