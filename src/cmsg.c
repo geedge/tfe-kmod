@@ -3,11 +3,23 @@
 #include <linux/socket.h>
 #include <linux/skbuff.h>
 #include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/tcp.h>
 
 #include "cmsg.h"
 
 extern const char * inet_ntop(int af, const void *src, char *dst, size_t size);
+
+static inline bool is_ipv4_pkt(const struct sk_buff * skb)
+{
+    return skb->protocol == htons(ETH_P_IP) && ip_hdr(skb)->version == 4;
+}
+
+static inline bool is_ipv6_pkt(const struct sk_buff * skb)
+{
+    return skb->protocol == htons(ETH_P_IPV6) && ipv6_hdr(skb)->version == 6;
+}
+
 
 void tcp_restore_info_dump_to_log(const struct tcp_restore_info * info)
 {
@@ -63,21 +75,45 @@ void tcp_restore_info_dump_to_log(const struct tcp_restore_info * info)
 
 int tcp_restore_info_parse_from_skb(struct sk_buff * skb, struct tcp_restore_info * out)
 {
-    struct iphdr * iphdr = ip_hdr(skb);
-    struct tcphdr * tcphdr = tcp_hdr(skb);
+    if(is_ipv4_pkt(skb))
+    {
+        struct iphdr * iphdr = ip_hdr(skb);
+        struct tcphdr * tcphdr = tcp_hdr(skb);
 
-    struct sockaddr_in * in_addr_client = (struct sockaddr_in *)&out->client.addr;
-    struct sockaddr_in * in_addr_server = (struct sockaddr_in *)&out->server.addr;
+        struct sockaddr_in * in_addr_client = (struct sockaddr_in *)&out->client.addr;
+        struct sockaddr_in * in_addr_server = (struct sockaddr_in *)&out->server.addr;
 
-    in_addr_client->sin_family = AF_INET;
-    in_addr_client->sin_addr.s_addr = iphdr->saddr;
-    in_addr_client->sin_port = tcphdr->source;
+        in_addr_client->sin_family = AF_INET;
+        in_addr_client->sin_addr.s_addr = iphdr->saddr;
+        in_addr_client->sin_port = tcphdr->source;
 
-    in_addr_server->sin_family = AF_INET;
-    in_addr_server->sin_addr.s_addr = iphdr->daddr;
-    in_addr_server->sin_port = tcphdr->dest;
+        in_addr_server->sin_family = AF_INET;
+        in_addr_server->sin_addr.s_addr = iphdr->daddr;
+        in_addr_server->sin_port = tcphdr->dest;
 
-    return 0;
+        return 0;
+    }
+
+    if(is_ipv6_pkt(skb))
+    {
+        struct ipv6hdr * ipv6hdr = ipv6_hdr(skb);
+        struct tcphdr * tcphdr = tcp_hdr(skb);
+
+        struct sockaddr_in6 * in6_addr_client = (struct sockaddr_in6 *)&out->client.addr;
+        struct sockaddr_in6 * in6_addr_server = (struct sockaddr_in6 *)&out->server.addr;
+
+        in6_addr_client->sin6_family = AF_INET6;
+        in6_addr_client->sin6_addr = ipv6hdr->saddr;
+        in6_addr_client->sin6_port = tcphdr->source;
+
+        in6_addr_server->sin6_family = AF_INET6;
+        in6_addr_server->sin6_addr = ipv6hdr->daddr;
+        in6_addr_server->sin6_port = tcphdr->dest;
+
+        return 0;
+    }
+
+    return -1;
 }
 
 int tcp_restore_info_parse_from_cmsg(const char * data, unsigned int datalen, struct tcp_restore_info * out)
