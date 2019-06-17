@@ -1,0 +1,45 @@
+#!/bin/sh
+
+tun_iface=eth3
+rtable_id_ingress=100
+rtable_id_egress=101
+rtable_id_ingress6=102
+rtable_id_egress6=103
+
+ifconfig ${tun_iface} 172.16.254.4
+ifconfig ${tun_iface} hw ether fe:65:b7:03:50:bd
+arp -s 172.16.254.254 aa:bb:cc:dd:ee:ff
+
+echo 1 > /proc/sys/net/ipv4/ip_forward
+echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
+echo 0 > /proc/sys/net/ipv4/tcp_window_scaling
+echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter
+echo 0 > /proc/sys/net/ipv4/conf/${tun_iface}/rp_filter
+
+sysctl -w net.ipv4.conf.default.rp_filter=0
+
+ip6tables -F
+ip6tables -F -t mangle
+ip6tables -F -t nat
+ip6tables -F -t raw
+
+# IPv6 Default GW
+ip addr add fd00::02/64 dev ${tun_iface}
+ip -6 route add default via fd00::01
+ip -6 neigh replace fd00::1 lladdr aa:bb:cc:dd:ee:ff dev ${tun_iface}
+
+# Ingress
+ip rule add iif ${tun_iface} tab ${rtable_id_ingress}
+ip route add local default dev lo table ${rtable_id_ingress}
+ip -6 rule add iif ${tun_iface} tab ${rtable_id_ingress6}
+ip -6 route add local default dev lo table ${rtable_id_ingress6}
+
+# Egress
+ip rule add fwmark 0x65 lookup ${rtable_id_egress}
+ip route add default dev ${tun_iface} via 172.16.254.254 table ${rtable_id_egress}
+
+# Flush cache
+ip route flush cache
+
+# insmod
+insmod tfe_kmod_core.ko ifname_cmsg=${tun_iface}
