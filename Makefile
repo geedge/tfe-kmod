@@ -1,6 +1,6 @@
 obj-m += tfe_kmod_core.o
-tfe_kmod_core-y := src/core.o src/util.o src/stat.o src/cmsg.o
-ccflags-y := -DDEBUG -g
+tfe_kmod_core-y := core.o util.o stat.o cmsg.o
+ccflags-n := -DDEBUG -g
 
 all:
 	 make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
