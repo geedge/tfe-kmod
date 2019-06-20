@@ -53,8 +53,6 @@ struct tfe_kmod_instance
     struct socket * scm_socket;
     struct nf_hook_ops nf_hook_ops_cmsg_input;
     struct nf_hook_ops nf_hook_ops_bfd_input;
-    struct net_device * netdev_cmsg_input;
-    struct net_device * netdev_bfd_input;
 
     /* workqueue */
     struct kthread_worker * k_worker;
@@ -141,7 +139,7 @@ static int __fd_send_to_tfe_userspace(struct socket * un_sock,
     }
     else if(unlikely(result < 0))
     {
-        pr_err("Failed at sendmsg to scm unix domain socket, result = %d\n", result);
+        pr_err_ratelimited("Failed at sendmsg to scm unix domain socket, result = %d\n", result);
         return result;
     }
 
@@ -360,6 +358,11 @@ errout:
         put_unused_fd(__fd);
     }
 
+    if(unlikely(__file != NULL))
+    {
+        fput(__file);
+    }
+
     if(unlikely(__sock != NULL))
     {
         sock_release(__sock);
@@ -480,8 +483,8 @@ errout:
     goto out;
 
 out:
-    kfree(restore_info);
     nf_reinject(restore_info->nf_queue_entry, NF_ACCEPT);
+    kfree(restore_info);
     return;
 }
 
@@ -521,10 +524,17 @@ static bool __get_cmsg_by_mark(struct sk_buff * skb, uint16_t * cmsg_offset)
     return false;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
 static void tfe_kernel_tcp_queue_hook_drop(struct net * net)
 {
     return;
 }
+#else
+static unsigned tfe_kernel_tcp_queue_hook_drop(struct net * net)
+{
+    return 0;
+}
+#endif
 
 int tfe_kernel_tcp_queue_outfn(struct nf_queue_entry *entry, unsigned int queuenum)
 {
@@ -842,16 +852,6 @@ static int tfe_kmod_instance_deinit(struct tfe_kmod_instance * instance)
         nf_unregister_net_hook(instance->netspace, &instance->nf_hook_ops_bfd_input);
     }
 
-    if(instance->netdev_bfd_input)
-    {
-        dev_put(instance->netdev_bfd_input);
-    }
-
-    if(instance->netdev_cmsg_input)
-    {
-        dev_put(instance->netdev_cmsg_input);
-    }
-
     if(instance->k_worker)
     {
         kthread_destroy_worker(instance->k_worker);
@@ -887,17 +887,8 @@ static int tfe_kmod_instance_init(struct tfe_kmod_instance * instance)
     instance->sk_scm_socket_path.sun_family = AF_UNIX;
     strcpy(instance->sk_scm_socket_path.sun_path, instance->str_scm_socket_path);
 
-    instance->netdev_cmsg_input = dev_get_by_name(instance->netspace, instance->ifname_cmsg_input);
-    if(instance->netdev_cmsg_input == NULL)
-    {
-        pr_err("Failed at finding cmsg input device %s\n", instance->ifname_cmsg_input);
-        goto errout;
-    }
-
-    pr_info("CMSG Incoming Interface: %s(%p)\n", instance->netdev_cmsg_input->name, instance->netdev_cmsg_input);
-
     result = __netfilter_ops_register(instance->netspace, &instance->nf_hook_ops_cmsg_input,
-            instance->ifname_cmsg_input, tfe_kernel_tcp_hook_entry, instance);
+            NULL, tfe_kernel_tcp_hook_entry, instance);
 
     if (result < 0)
     {
