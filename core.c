@@ -632,6 +632,12 @@ int tfe_kernel_tcp_queue_outfn(struct nf_queue_entry *entry, unsigned int queuen
     return 0;
 
 errout:
+    if(restore_info != NULL)
+    {
+        kfree(restore_info);
+    }
+
+    tfe_kmod_stat_add(instance->stat, TFE_KMOD_STAT_CMSG_DROP_QUEUE, 1);
     return -ENOBUFS;
 }
 

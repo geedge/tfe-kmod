@@ -21,6 +21,7 @@ static const char * str_stat_entry[] =
     [TFE_KMOD_STAT_CMSG_NOT_HIT] = "CmsgNotHit",
     [TFE_KMOD_STAT_CMSG_INVALID_FORMAT] = "CmsgInvalidFormat",
     [TFE_KMOD_STAT_CMSG_IN_QUEUE] = "CmsgInQueue",
+    [TFE_KMOD_STAT_CMSG_DROP_QUEUE] = "CmsgDropInQueue",
     [TFE_KMOD_STAT_RESTORE_NEW] = "RestoreNew",
     [TFE_KMOD_STAT_RESTORE_FAIL_AT_RESTORE] = "RestoreFailAtSocketSetup",
     [TFE_KMOD_STAT_RESTORE_FAIL_AT_SENDMSG] = "RestoreFailAtSendMsg",
