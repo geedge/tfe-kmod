@@ -273,7 +273,7 @@ static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_resto
         nr_tcp_repair_opts++;
     }
 
-    if (endpoint->wscale_perm)
+    if (endpoint->wscale_perm && peer->wscale_perm)
     {
         tcp_repair_opts[nr_tcp_repair_opts].opt_code = TCPOPT_WINDOW;
         tcp_repair_opts[nr_tcp_repair_opts].opt_val = (endpoint->wscale << 16 ) | peer->wscale;
@@ -583,7 +583,7 @@ int tfe_kernel_tcp_queue_outfn(struct nf_queue_entry *entry, unsigned int queuen
     cmsg_payload = tcp_payload + cmsg_offset;
     cmsg_payload_len = tcp_payload_len - cmsg_offset;
 
-    restore_info = (struct tcp_restore_info *)kmalloc(sizeof(struct tcp_restore_info), GFP_ATOMIC);
+    restore_info = (struct tcp_restore_info *)kzalloc(sizeof(struct tcp_restore_info), GFP_ATOMIC);
     if(unlikely(restore_info == NULL))
     {
         pr_err("Failed at alloc memory for restore info, drop it.\n");
