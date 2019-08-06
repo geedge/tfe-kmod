@@ -22,10 +22,7 @@
 
 #include "cmsg.h"
 #include "stat.h"
-
-#ifndef TFE_KMOD_VERSION
-#define TFE_KMOD_VERSION 	"Unknown"
-#endif
+#include "version.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Lu Qiuwen");
