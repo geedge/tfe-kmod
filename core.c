@@ -301,7 +301,6 @@ static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_resto
         goto errout;
     }
 
-#if 0
     /* Perpare Window Setup */
     tcp_repair_window.snd_wl1 = peer->seq;
     tcp_repair_window.snd_wnd = peer->window;
@@ -318,7 +317,6 @@ static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_resto
         printk(KERN_ERR "Failed at setsockopt(TCP_REPAIR_WINDOW), result = %d\n", result);
         goto errout;
     }
-#endif
 
     sockopt = 0;
     result = kernel_setsockopt(__sock, SOL_TCP, TCP_REPAIR, (char *)&sockopt, sizeof(sockopt));
