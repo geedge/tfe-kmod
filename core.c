@@ -46,34 +46,24 @@ struct tfe_kmod_instance
     char ifname_bfd_input[IFNAMSIZ];
 
     /* Instances */
-    struct net * netspace;
-    struct socket * scm_socket;
+    struct net *netspace;
+    struct socket *scm_socket;
     struct nf_hook_ops nf_hook_ops_cmsg_input;
     struct nf_hook_ops nf_hook_ops_bfd_input;
 
     /* workqueue */
-    struct kthread_worker * k_worker;
+    struct kthread_worker *k_worker;
 
     /* Stat */
-    struct tfe_kmod_stat * stat;
+    struct tfe_kmod_stat *stat;
 };
 
-static char * ifname_cmsg = "lo";
-static char * ifname_bfd = "lo";
-static char * scm_socket = "/var/run/.tfe_kmod_scm_socket";
-static char * scm_socket_kern = "/var/run/.tfe_kmod_scm_socket_kern";
+static char *scm_socket = "/var/run/.tfe_kmod_scm_socket";
 static unsigned int fd_so_mask = 0x65;
 
-static const char * rm_program_path = "/bin/rm";
-static char * rm_program_envp[] = { "HOME=/", "TERM=linux", "PATH=/usr/bin:/bin", NULL };
-
 static struct tfe_kmod_instance tfe_kmod_instance;
-struct tfe_kmod_instance * g_tfe_kmod_instance = &tfe_kmod_instance;
+struct tfe_kmod_instance *g_tfe_kmod_instance = &tfe_kmod_instance;
 
-module_param(ifname_cmsg, charp, S_IRUGO);
-MODULE_PARM_DESC(ifname_cmsg, "Network interface for incoming control message");
-module_param(ifname_bfd, charp, S_IRUGO);
-MODULE_PARM_DESC(ifname_bfd, "Network interface for BFD keepalive message");
 module_param(scm_socket, charp, S_IRUGO);
 MODULE_PARM_DESC(scm_socket, "SCM socket file location");
 
@@ -86,33 +76,33 @@ static int __call_sys_close(int fd)
 #endif
 }
 
-static inline bool is_ipv4_pkt(const struct sk_buff * skb)
+static inline bool is_ipv4_pkt(const struct sk_buff *skb)
 {
     return skb->protocol == htons(ETH_P_IP) && ip_hdr(skb)->version == 4;
 }
 
-static inline bool is_ipv6_pkt(const struct sk_buff * skb)
+static inline bool is_ipv6_pkt(const struct sk_buff *skb)
 {
     return skb->protocol == htons(ETH_P_IPV6) && ipv6_hdr(skb)->version == 6;
 }
 
-static int __fd_send_to_tfe_userspace(struct socket * un_sock, 
-        int fd_client, int fd_server, const uint8_t * msg, unsigned int msglen)
+static int __fd_send_to_tfe_userspace(struct socket *un_sock,
+                                      int fd_client, int fd_server, const uint8_t *msg, unsigned int msglen)
 {
-    union
-    {
-        char   buf[CMSG_SPACE(sizeof(int) * 2)];
+    union {
+        char buf[CMSG_SPACE(sizeof(int) * 2)];
         struct cmsghdr align;
     } controlMsg;
 
     struct cmsghdr *cmsgp;
     struct msghdr msgh;
     int result = 0;
+    int retry_times = 0;
 
     struct kvec iv;
     iv.iov_base = (void *)msg;
     iv.iov_len = msglen;
-  
+
     memset(&msgh, 0, sizeof(msgh));
     msgh.msg_name = &g_tfe_kmod_instance->sk_scm_socket_path;
     msgh.msg_namelen = sizeof(g_tfe_kmod_instance->sk_scm_socket_path);
@@ -126,31 +116,52 @@ static int __fd_send_to_tfe_userspace(struct socket * un_sock,
     cmsgp->cmsg_level = SOL_SOCKET;
     cmsgp->cmsg_type = SCM_RIGHTS;
 
-    ((int *) CMSG_DATA(cmsgp))[0] = fd_server;
-    ((int *) CMSG_DATA(cmsgp))[1] = fd_client;
+    ((int *)CMSG_DATA(cmsgp))[0] = fd_server;
+    ((int *)CMSG_DATA(cmsgp))[1] = fd_client;
 
-    result = kernel_sendmsg(un_sock, &msgh, &iv, 1, msglen);
-    if(unlikely(result < 0) && (result == -ECONNREFUSED || result == -ENOENT))
+    while (1)
     {
-        return result;
-    }
-    else if(unlikely(result < 0))
-    {
-        pr_err_ratelimited("Failed at sendmsg to scm unix domain socket, result = %d\n", result);
-        return result;
+        result = kernel_sendmsg(un_sock, &msgh, &iv, 1, msglen);
+        if (likely(result >= 0))
+        {
+            break;
+        }
+
+        /* TFE program is not running */
+        if (result == -ECONNREFUSED || result == -ENOENT)
+        {
+            goto errout;
+        }
+
+        /* TFE is busy, try once again */
+        if (result == -EAGAIN || result == -ENOSPC)
+        {
+            if (++retry_times <= 8)
+                continue;
+
+            /* Too many tries, abort the sendmsg */
+            pr_err_ratelimited("sendmsg to scm unix domain socket failed, retry too many times(%d).\n", result);
+            goto errout;
+        }
+
+        pr_err_ratelimited("sendmsg to scm unix domain socket failed(%d).\n", result);
+        goto errout;
     }
 
+    /* Close fds, these fds will have a copy in tfe program */
     __call_sys_close(fd_client);
     __call_sys_close(fd_server);
+    return result;
 
+errout:
     return result;
 }
 
-static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_restore_info_endpoint * endpoint, 
-        const struct tcp_restore_info_endpoint * peer)
+static int __tcp_restore_fd_create(struct net *netspace, const struct tcp_restore_info_endpoint *endpoint,
+                                   const struct tcp_restore_info_endpoint *peer)
 {
-    struct socket * __sock = NULL;
-    struct file * __file = NULL;
+    struct socket *__sock = NULL;
+    struct file *__file = NULL;
     int __fd = 0;
 
     int result = 0;
@@ -166,7 +177,7 @@ static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_resto
     {
         result = sock_create_kern(netspace, AF_INET, SOCK_STREAM, IPPROTO_TCP, &__sock);
     }
-    else if(endpoint->addr.ss_family == AF_INET6)
+    else if (endpoint->addr.ss_family == AF_INET6)
     {
         result = sock_create_kern(netspace, AF_INET6, SOCK_STREAM, IPPROTO_TCP, &__sock);
     }
@@ -248,15 +259,15 @@ static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_resto
     }
 
 #ifndef TCPOPT_MAXSEG
-#define TCPOPT_MAXSEG            2
+#define TCPOPT_MAXSEG 2
 #endif
 
 #ifndef TCPOPT_WINDOW
-#define TCPOPT_WINDOW            3
+#define TCPOPT_WINDOW 3
 #endif
 
 #ifndef TCPOPT_SACK_PERMITTED
-#define TCPOPT_SACK_PERMITTED    4
+#define TCPOPT_SACK_PERMITTED 4
 #endif
 
     tcp_repair_opts[nr_tcp_repair_opts].opt_code = TCPOPT_MAXSEG;
@@ -273,7 +284,7 @@ static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_resto
     if (endpoint->wscale_perm && peer->wscale_perm)
     {
         tcp_repair_opts[nr_tcp_repair_opts].opt_code = TCPOPT_WINDOW;
-        tcp_repair_opts[nr_tcp_repair_opts].opt_val = (endpoint->wscale << 16 ) | peer->wscale;
+        tcp_repair_opts[nr_tcp_repair_opts].opt_val = (endpoint->wscale << 16) | peer->wscale;
         nr_tcp_repair_opts++;
     }
 
@@ -292,8 +303,8 @@ static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_resto
         goto errout;
     }
 
-    result = kernel_setsockopt(__sock, SOL_TCP, TCP_REPAIR_OPTIONS, (char *)tcp_repair_opts, 
-            nr_tcp_repair_opts * sizeof(struct tcp_repair_opt));
+    result = kernel_setsockopt(__sock, SOL_TCP, TCP_REPAIR_OPTIONS, (char *)tcp_repair_opts,
+                               nr_tcp_repair_opts * sizeof(struct tcp_repair_opt));
 
     if (unlikely(result < 0))
     {
@@ -310,7 +321,7 @@ static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_resto
     tcp_repair_window.rcv_wup = endpoint->ack;
 
     result = kernel_setsockopt(__sock, SOL_TCP, TCP_REPAIR_WINDOW, (char *)&tcp_repair_window,
-            sizeof(tcp_repair_window));
+                               sizeof(tcp_repair_window));
 
     if (unlikely(result < 0))
     {
@@ -341,24 +352,25 @@ static int __tcp_restore_fd_create(struct net * netspace, const struct tcp_resto
     if (unlikely(IS_ERR(__file)))
     {
         pr_err("Failed at sock_alloc_file(), result = %ld\n", PTR_ERR(__file));
-        result = PTR_ERR(__file); goto errout;
+        result = PTR_ERR(__file);
+        goto errout;
     }
 
     fd_install(__fd, __file);
     return __fd;
 
 errout:
-    if(unlikely(__fd > 0))
+    if (unlikely(__fd > 0))
     {
         put_unused_fd(__fd);
     }
 
-    if(unlikely(__file != NULL))
+    if (unlikely(__file != NULL))
     {
         fput(__file);
     }
 
-    if(unlikely(__sock != NULL))
+    if (unlikely(__sock != NULL))
     {
         sock_release(__sock);
     }
@@ -367,8 +379,8 @@ errout:
 }
 
 static bool tcp_find_option(uint8_t option, const struct sk_buff *skb,
-        unsigned int protoff, unsigned int optlen, uint8_t * out_optlen, 
-        char * out_optvalue, unsigned int out_optvalue_len)
+                            unsigned int protoff, unsigned int optlen, uint8_t *out_optlen,
+                            char *out_optvalue, unsigned int out_optvalue_len)
 {
     /* tcp.doff is only 4 bits, ie. max 15 * 4 bytes */
     const uint8_t *op;
@@ -380,55 +392,57 @@ static bool tcp_find_option(uint8_t option, const struct sk_buff *skb,
 
     /* If we don't have the whole header, drop packet. */
     op = skb_header_pointer(skb, protoff + sizeof(struct tcphdr), optlen, _opt);
-    if (op == NULL) 
+    if (op == NULL)
     {
         pr_debug("skb=%p, don't have whole header, ignore it.\n", skb);
         return false;
     }
 
-    for (i = 0; i < optlen; )
+    for (i = 0; i < optlen;)
     {
         uint8_t __optlen;
         uint8_t __valuelen;
 
         if (op[i] == option)
         {
-            if(op[i] < 2)
+            if (op[i] < 2)
             {
                 *out_optlen = 0;
                 return true;
             }
 
-            __optlen = op[i+1];
-            if(unlikely(__optlen <= 2))
+            __optlen = op[i + 1];
+            if (unlikely(__optlen <= 2))
             {
                 pr_err_ratelimited("Invalid tcp option length, must be larger than 2, but the value is %u\n", __optlen);
                 return false;
             }
 
             __valuelen = __optlen - 2;
-            if(unlikely(__valuelen > out_optvalue_len))
+            if (unlikely(__valuelen > out_optvalue_len))
             {
                 pr_warn_ratelimited("tcp option length is larger input buffer\n");
                 return false;
             }
 
             *out_optlen = __valuelen;
-            memcpy(out_optvalue, &op[i+2], __valuelen);
+            memcpy(out_optvalue, &op[i + 2], __valuelen);
             return true;
         }
 
-        if (op[i] < 2) i++;
-        else i += op[i+1]?:1;
+        if (op[i] < 2)
+            i++;
+        else
+            i += op[i + 1] ?: 1;
     }
 
     return false;
 }
 
-void tfe_kernel_tcp_restore_wkqueue_entry(struct kthread_work * wk)
+void tfe_kernel_tcp_restore_wkqueue_entry(struct kthread_work *wk)
 {
-    struct tcp_restore_info * restore_info = container_of(wk, struct tcp_restore_info, kthread_work);
-    struct tfe_kmod_instance * instance = restore_info->instance;
+    struct tcp_restore_info *restore_info = container_of(wk, struct tcp_restore_info, kthread_work);
+    struct tfe_kmod_instance *instance = restore_info->instance;
 
     int fd_client = 0;
     int fd_server = 0;
@@ -438,24 +452,24 @@ void tfe_kernel_tcp_restore_wkqueue_entry(struct kthread_work * wk)
 
     /* Create FDs */
     fd_client = __tcp_restore_fd_create(instance->netspace, &restore_info->client, &restore_info->server);
-    if(unlikely(fd_client < 0))
+    if (unlikely(fd_client < 0))
     {
         tfe_kmod_stat_add(instance->stat, TFE_KMOD_STAT_RESTORE_FAIL_AT_RESTORE, 1);
         goto errout;
     }
 
     fd_server = __tcp_restore_fd_create(instance->netspace, &restore_info->server, &restore_info->client);
-    if(unlikely(fd_server < 0))
+    if (unlikely(fd_server < 0))
     {
         tfe_kmod_stat_add(instance->stat, TFE_KMOD_STAT_RESTORE_FAIL_AT_RESTORE, 1);
         goto errout;
     }
 
     /* Send FDs to userspace application */
-    result = __fd_send_to_tfe_userspace(instance->scm_socket, fd_client, fd_server, 
-            restore_info->cmsg, restore_info->cmsg_len);
+    result = __fd_send_to_tfe_userspace(instance->scm_socket, fd_client, fd_server,
+                                        restore_info->cmsg, restore_info->cmsg_len);
 
-    if(unlikely(result < 0))
+    if (unlikely(result < 0))
     {
         tfe_kmod_stat_add(instance->stat, TFE_KMOD_STAT_RESTORE_FAIL_AT_SENDMSG, 1);
         goto errout;
@@ -465,12 +479,12 @@ void tfe_kernel_tcp_restore_wkqueue_entry(struct kthread_work * wk)
     goto out;
 
 errout:
-    if(unlikely(fd_client != 0))
+    if (unlikely(fd_client != 0))
     {
         __call_sys_close(fd_client);
     }
 
-    if(unlikely(fd_server != 0))
+    if (unlikely(fd_server != 0))
     {
         __call_sys_close(fd_server);
     }
@@ -483,8 +497,7 @@ out:
     return;
 }
 
-union __cmsg_so_mark
-{
+union __cmsg_so_mark {
     __u32 mark_value;
     struct
     {
@@ -493,24 +506,24 @@ union __cmsg_so_mark
     } mark_struct;
 };
 
-static bool __is_cmsg_by_mark(const struct sk_buff * skb)
+static bool __is_cmsg_by_mark(const struct sk_buff *skb)
 {
-    union __cmsg_so_mark * mark = (union __cmsg_so_mark *)&skb->mark;
+    union __cmsg_so_mark *mark = (union __cmsg_so_mark *)&skb->mark;
     return !!(mark->mark_struct.magic[0] == 0x4d && mark->mark_struct.magic[1] == 0x5a);
 }
 
-static void __set_cmsg_by_mark(struct sk_buff * skb, uint16_t cmsg_offset)
+static void __set_cmsg_by_mark(struct sk_buff *skb, uint16_t cmsg_offset)
 {
-    union __cmsg_so_mark * mark = (union __cmsg_so_mark *)&skb->mark;
+    union __cmsg_so_mark *mark = (union __cmsg_so_mark *)&skb->mark;
     mark->mark_struct.magic[0] = 0x4d;
     mark->mark_struct.magic[1] = 0x5a;
     mark->mark_struct.offset = cmsg_offset;
 }
 
-static bool __get_cmsg_by_mark(struct sk_buff * skb, uint16_t * cmsg_offset)
+static bool __get_cmsg_by_mark(struct sk_buff *skb, uint16_t *cmsg_offset)
 {
-    union __cmsg_so_mark * mark = (union __cmsg_so_mark *)&skb->mark;
-    if(__is_cmsg_by_mark(skb))
+    union __cmsg_so_mark *mark = (union __cmsg_so_mark *)&skb->mark;
+    if (__is_cmsg_by_mark(skb))
     {
         *cmsg_offset = mark->mark_struct.offset;
         return true;
@@ -520,12 +533,12 @@ static bool __get_cmsg_by_mark(struct sk_buff * skb, uint16_t * cmsg_offset)
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
-static void tfe_kernel_tcp_queue_hook_drop(struct net * net)
+static void tfe_kernel_tcp_queue_hook_drop(struct net *net)
 {
     return;
 }
 #else
-static unsigned tfe_kernel_tcp_queue_hook_drop(struct net * net)
+static unsigned tfe_kernel_tcp_queue_hook_drop(struct net *net)
 {
     return 0;
 }
@@ -533,35 +546,35 @@ static unsigned tfe_kernel_tcp_queue_hook_drop(struct net * net)
 
 int tfe_kernel_tcp_queue_outfn(struct nf_queue_entry *entry, unsigned int queuenum)
 {
-    struct sk_buff * skb = entry->skb;
-    struct tfe_kmod_instance * instance = g_tfe_kmod_instance;
+    struct sk_buff *skb = entry->skb;
+    struct tfe_kmod_instance *instance = g_tfe_kmod_instance;
 
     struct tcphdr _tcp_hdr;
-    struct tcphdr * tcp_hdr;
+    struct tcphdr *tcp_hdr;
     unsigned int tcp_hdr_len;
 
-    const uint8_t * tcp_payload;
+    const uint8_t *tcp_payload;
     unsigned int tcp_payload_len;
 
-    const uint8_t * cmsg_payload;
+    const uint8_t *cmsg_payload;
     unsigned int cmsg_payload_len;
 
     /* Restore info */
-    struct tcp_restore_info * restore_info = NULL;
+    struct tcp_restore_info *restore_info = NULL;
 
-	 /* TCP Options */
+    /* TCP Options */
     uint16_t cmsg_offset;
 
     /* Result */
     int result = 0;
-    if(!__get_cmsg_by_mark(skb, &cmsg_offset))
+    if (!__get_cmsg_by_mark(skb, &cmsg_offset))
     {
         goto errout;
     }
 
     skb_linearize(skb);
 
-	/* TCP Header */
+    /* TCP Header */
     tcp_hdr = skb_header_pointer(skb, skb_transport_offset(skb), sizeof(_tcp_hdr), &_tcp_hdr);
     tcp_hdr_len = tcp_hdr->doff * 4;
 
@@ -579,7 +592,7 @@ int tfe_kernel_tcp_queue_outfn(struct nf_queue_entry *entry, unsigned int queuen
     cmsg_payload_len = tcp_payload_len - cmsg_offset;
 
     restore_info = (struct tcp_restore_info *)kzalloc(sizeof(struct tcp_restore_info), GFP_ATOMIC);
-    if(unlikely(restore_info == NULL))
+    if (unlikely(restore_info == NULL))
     {
         pr_err("Failed at alloc memory for restore info, drop it.\n");
         goto errout;
@@ -592,28 +605,28 @@ int tfe_kernel_tcp_queue_outfn(struct nf_queue_entry *entry, unsigned int queuen
 
     /* Construct restore info from packet */
     result = tcp_restore_info_parse_from_skb(skb, restore_info);
-    if(unlikely(result < 0))
+    if (unlikely(result < 0))
     {
         goto errout;
     }
 
     /* ClientHello with leader */
     result = tcp_restore_info_parse_from_cmsg(cmsg_payload, cmsg_payload_len, restore_info);
-    if(unlikely(result < 0))
+    if (unlikely(result < 0))
     {
         goto errout;
     }
 
     /* Remove cmsg from clienthello, trim the skb and ip payload length */
     skb_trim(skb, skb->len - cmsg_payload_len);
-    if(skb->protocol == ntohs(ETH_P_IP))
+    if (skb->protocol == ntohs(ETH_P_IP))
     {
-        struct iphdr * p_ip_hdr = ip_hdr(skb);
+        struct iphdr *p_ip_hdr = ip_hdr(skb);
         p_ip_hdr->tot_len = htons(ntohs(p_ip_hdr->tot_len) - cmsg_payload_len);
     }
-    else if(skb->protocol == ntohs(ETH_P_IPV6))
+    else if (skb->protocol == ntohs(ETH_P_IPV6))
     {
-        struct ipv6hdr * p_ipv6_hdr = ipv6_hdr(skb);
+        struct ipv6hdr *p_ipv6_hdr = ipv6_hdr(skb);
         p_ipv6_hdr->payload_len = htons(ntohs(p_ipv6_hdr->payload_len) - cmsg_payload_len);
     }
 
@@ -627,7 +640,7 @@ int tfe_kernel_tcp_queue_outfn(struct nf_queue_entry *entry, unsigned int queuen
     return 0;
 
 errout:
-    if(restore_info != NULL)
+    if (restore_info != NULL)
     {
         kfree(restore_info);
     }
@@ -641,13 +654,13 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
     /* Filter ClientHello from all incoming packets,
     * ClientHello may exist in all TCP packets */
 
-    struct tfe_kmod_instance * instance;
-    struct iphdr * ip_hdr = NULL;
-    struct ipv6hdr * ipv6_hdr = NULL;
+    struct tfe_kmod_instance *instance;
+    struct iphdr *ip_hdr = NULL;
+    struct ipv6hdr *ipv6_hdr = NULL;
 
     /* TCP header */
     struct tcphdr _tcp_hdr;
-    struct tcphdr * tcp_hdr;
+    struct tcphdr *tcp_hdr;
     unsigned int tcp_hdr_len;
 
     /* TCP Options */
@@ -658,14 +671,7 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
     instance = (struct tfe_kmod_instance *)priv;
     BUG_ON(instance == NULL || instance->netspace == NULL);
 
-#if 0
-    if(state->in->ifindex != instance->netdev_cmsg_input->ifindex)
-    {
-        goto not_mine;
-    }
-#endif
-
-    if(skb->protocol == htons(ETH_P_IP))
+    if (skb->protocol == htons(ETH_P_IP))
     {
         struct iphdr _ip_hdr;
         ip_hdr = skb_header_pointer(skb, skb_network_offset(skb), sizeof(_ip_hdr), &_ip_hdr);
@@ -676,7 +682,7 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
             goto not_mine;
         }
     }
-    else if(skb->protocol == htons(ETH_P_IPV6))
+    else if (skb->protocol == htons(ETH_P_IPV6))
     {
         struct ipv6hdr _ipv6_hdr;
         ipv6_hdr = skb_header_pointer(skb, skb_network_offset(skb), sizeof(_ipv6_hdr), &_ipv6_hdr);
@@ -696,16 +702,16 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
     tcp_hdr_len = tcp_hdr->doff * 4;
 
     /* Check if there is a tcp options */
-    if(!tcp_hdr || tcp_hdr_len <= sizeof(struct tcphdr))
+    if (!tcp_hdr || tcp_hdr_len <= sizeof(struct tcphdr))
     {
         goto not_mine;
     }
 
     is_hit_tcpopt = tcp_find_option(TCP_RESTORE_TCPOPT_KIND, skb, skb_transport_offset(skb),
-            tcp_hdr_len - sizeof(struct tcphdr), &restore_tcpopt_length, 
-            (char *)&cmsg_offset, sizeof(cmsg_offset));
+                                    tcp_hdr_len - sizeof(struct tcphdr), &restore_tcpopt_length,
+                                    (char *)&cmsg_offset, sizeof(cmsg_offset));
 
-    if(!is_hit_tcpopt || restore_tcpopt_length != 2)
+    if (!is_hit_tcpopt || restore_tcpopt_length != 2)
     {
         goto not_mine;
     }
@@ -721,40 +727,40 @@ unsigned int tfe_kernel_tcp_hook_entry(void *priv, struct sk_buff *skb, const st
 
     /* defer the skb to queue, handle in tfe_kernel_tcp_queue_outfn() */
     return NF_QUEUE;
-    
+
 not_mine:
     return NF_ACCEPT;
 }
 
 static int __rlimit_fs(struct task_struct *tsk, unsigned int fs_limit)
 {
-	int retval = 0;
-	if (fs_limit > 65536)
+    int retval = 0;
+    if (fs_limit > 65536)
     {
         return -EPERM;
-	}
+    }
 
-	/* protect tsk->signal and tsk->sighand from disappearing */
-	if (!tsk->sighand)
+    /* protect tsk->signal and tsk->sighand from disappearing */
+    if (!tsk->sighand)
     {
-		retval = -ESRCH;
-		goto out;
-	}
+        retval = -ESRCH;
+        goto out;
+    }
 
-	task_lock(tsk->group_leader);
+    task_lock(tsk->group_leader);
     tsk->signal->rlim[RLIMIT_NOFILE].rlim_cur = fs_limit;
     tsk->signal->rlim[RLIMIT_NOFILE].rlim_max = fs_limit;
-	task_unlock(tsk->group_leader);
+    task_unlock(tsk->group_leader);
 
 out:
-	return retval;
+    return retval;
 }
 
-static int __netfilter_ops_register(struct net * netspace, 
-        struct nf_hook_ops * ops, const char * ifname, nf_hookfn * fn, void * arg)
+static int __netfilter_ops_register(struct net *netspace, struct nf_hook_ops *ops,
+                                    const char *ifname, nf_hookfn *fn, void *arg)
 {
     int result = 0;
-    
+
     ops->hook = fn;
 
     ops->hooknum = NF_INET_PRE_ROUTING;
@@ -775,21 +781,13 @@ errout:
     return result;
 }
 
-static struct socket * __scm_socket_create(struct net * netspace, const char * path)
+static struct socket *__scm_socket_create(struct net *netspace, const char *path)
 {
     struct sockaddr_un un_addr;
     struct sockaddr_un un_addr_target;
 
-    struct socket * un_sock = NULL;
+    struct socket *un_sock = NULL;
     int result;
-
-    char * rm_ops_argv[] = 
-    {
-        (char *)rm_program_path,
-        "-f",
-        (char *)path,
-        NULL
-    };
 
     memset(&un_addr, 0, sizeof(un_addr));
     un_addr.sun_family = AF_UNIX;
@@ -797,68 +795,46 @@ static struct socket * __scm_socket_create(struct net * netspace, const char * p
 
     memset(&un_addr_target, 0, sizeof(un_addr_target));
     un_addr_target.sun_family = AF_UNIX;
-    strcpy(un_addr_target.sun_path, g_tfe_kmod_instance->str_scm_socket_path);
+    strcpy(un_addr_target.sun_path, path);
 
-    pr_debug("%s %s %s\n", rm_program_path, "-f", path);
-    result = call_usermodehelper(rm_program_path, rm_ops_argv, rm_program_envp, UMH_WAIT_PROC);
-
-    if (unlikely(result < 0))
-    {
-        printk(KERN_ERR "Failed at removing file %s, result = %d\n", path, result);
-        goto errout;
-    }
-       	
     result = sock_create_kern(netspace, AF_UNIX, SOCK_DGRAM, 0, &un_sock);
     if (unlikely(result < 0))
     {
-        printk(KERN_ERR "Failed at creating unixdomain socket for %s\n", un_addr.sun_path);
+        pr_err("Failed at creating unixdomain socket for %s\n", un_addr.sun_path);
         goto errout;
     }
-
-#if 0
-    result = kernel_connect(un_sock, (struct sockaddr *)&un_addr_target, sizeof(un_addr_target), 0);
-    if (unlikely(result == -ENOTCONN))
-    {
-        goto success;
-    }
-
-    if (unlikely(result < 0))
-    {
-        printk(KERN_ERR "Failed at connection unixdomain socket to %s\n", un_addr_target.sun_path);
-        goto errout;
-    }
-#endif
 
     return un_sock;
 
 errout:
-    if (un_sock) sock_release(un_sock); 
+    if (un_sock)
+        sock_release(un_sock);
     return NULL;
 }
 
-static int tfe_kmod_instance_deinit(struct tfe_kmod_instance * instance)
+static int tfe_kmod_instance_deinit(struct tfe_kmod_instance *instance)
 {
-    if(instance->scm_socket != NULL)
+    if (instance->scm_socket != NULL)
     {
         sock_release(instance->scm_socket);
     }
 
-    if(instance->nf_hook_ops_cmsg_input.hook)
+    if (instance->nf_hook_ops_cmsg_input.hook)
     {
         nf_unregister_net_hook(instance->netspace, &instance->nf_hook_ops_cmsg_input);
     }
 
-    if(instance->nf_hook_ops_bfd_input.hook)
+    if (instance->nf_hook_ops_bfd_input.hook)
     {
         nf_unregister_net_hook(instance->netspace, &instance->nf_hook_ops_bfd_input);
     }
 
-    if(instance->k_worker)
+    if (instance->k_worker)
     {
         kthread_destroy_worker(instance->k_worker);
     }
 
-    if(instance->stat)
+    if (instance->stat)
     {
         tfe_kmod_stat_destroy(instance->stat);
     }
@@ -867,21 +843,20 @@ static int tfe_kmod_instance_deinit(struct tfe_kmod_instance * instance)
     return 0;
 }
 
-static const struct nf_queue_handler tfe_kmod_nfqh = 
-{
-    .outfn= tfe_kernel_tcp_queue_outfn,
-    .nf_hook_drop = tfe_kernel_tcp_queue_hook_drop
-};
+static const struct nf_queue_handler tfe_kmod_nfqh =
+    {
+        .outfn = tfe_kernel_tcp_queue_outfn,
+        .nf_hook_drop = tfe_kernel_tcp_queue_hook_drop};
 
-static int tfe_kmod_instance_init(struct tfe_kmod_instance * instance)
+static int tfe_kmod_instance_init(struct tfe_kmod_instance *instance)
 {
     int result = 0;
 
     instance->netspace = &init_net;
-    instance->scm_socket = __scm_socket_create(instance->netspace, scm_socket_kern);
+    instance->scm_socket = __scm_socket_create(instance->netspace, scm_socket);
     if (instance->scm_socket == NULL)
     {
-        pr_err("Failed at creating scm socket for %s\n", scm_socket_kern);
+        pr_err("Failed at creating scm socket for %s\n", scm_socket);
         goto errout;
     }
 
@@ -889,30 +864,25 @@ static int tfe_kmod_instance_init(struct tfe_kmod_instance * instance)
     strcpy(instance->sk_scm_socket_path.sun_path, instance->str_scm_socket_path);
 
     result = __netfilter_ops_register(instance->netspace, &instance->nf_hook_ops_cmsg_input,
-            NULL, tfe_kernel_tcp_hook_entry, instance);
+                                      NULL, tfe_kernel_tcp_hook_entry, instance);
 
-    if (result < 0)
+    instance->k_worker = kthread_create_worker(0, "tfe-tcp-restore");
+    if (IS_ERR(instance->k_worker))
     {
-        pr_err("Failed at register netfilter for cmsg at interface %s\n", instance->ifname_cmsg_input);
+        pr_err("Failed at creating kthread worker for tcp restore, result = %ld\n", PTR_ERR(instance->k_worker));
+        instance->k_worker = NULL;
         goto errout;
     }
 
-    instance->k_worker = kthread_create_worker(0, "tfe-tcp-restore");
-    if(IS_ERR(instance->k_worker))
-    {
-        pr_err("Failed at creating kthread worker for tcp restore, result = %ld\n", PTR_ERR(instance->k_worker));
-        instance->k_worker = NULL; goto errout;
-    }
-
     result = __rlimit_fs(instance->k_worker->task, 65535);
-    if(result < 0)
+    if (result < 0)
     {
         pr_err("Failed at set NOFILE limit for kthread worker, result = %d\n", result);
         goto errout;
     }
 
     instance->stat = tfe_kmod_stat_create(instance->netspace);
-    if(!instance->stat)
+    if (!instance->stat)
     {
         pr_err("Failed at creating stat handler.\n");
         goto errout;
@@ -926,13 +896,11 @@ errout:
     return -EFAULT;
 }
 
-static int __init tfe_kmod_init(void) 
+static int __init tfe_kmod_init(void)
 {
     int result;
     pr_info("Tango Frontend Engine Kernel Module, Version: %s\n", TFE_KMOD_VERSION);
 
-    strlcpy(g_tfe_kmod_instance->ifname_cmsg_input, ifname_cmsg, sizeof(g_tfe_kmod_instance->ifname_cmsg_input));
-    strlcpy(g_tfe_kmod_instance->ifname_bfd_input, ifname_bfd, sizeof(g_tfe_kmod_instance->ifname_bfd_input));
     strlcpy(g_tfe_kmod_instance->str_scm_socket_path, scm_socket, sizeof(g_tfe_kmod_instance->str_scm_socket_path));
 
     result = tfe_kmod_instance_init(g_tfe_kmod_instance);
@@ -946,7 +914,7 @@ static int __init tfe_kmod_init(void)
     return 0;
 }
 
-static void __exit tfe_kmod_exit(void) 
+static void __exit tfe_kmod_exit(void)
 {
     tfe_kmod_instance_deinit(g_tfe_kmod_instance);
 }
