@@ -19,6 +19,13 @@ enum tcp_restore_info_tlv_type
     TCP_RESTORE_INFO_TLV_PROTOCOL = 0xa,
     TCP_RESTORE_INFO_WINDOW_CLIENT = 0xb,
     TCP_RESTORE_INFO_WINDOW_SERVER = 0xc,
+    TCP_RESTORE_INFO_PACKET_CUR_DIR = 0xd
+};
+
+enum tcp_restore_pkt_cur_dir
+{
+    PKT_CUR_DIR_C2S = 0x1,
+    PKT_CUR_DIR_S2C = 0x2
 };
 
 struct tcp_restore_info_endpoint
@@ -36,10 +43,11 @@ struct tcp_restore_info_endpoint
 
 struct tcp_restore_info
 {
-    struct tfe_kmod_instance * instance;
+    struct tfe_kmod_instance *instance;
     struct kthread_work kthread_work;
-    struct nf_queue_entry * nf_queue_entry;
+    struct nf_queue_entry *nf_queue_entry;
 
+    enum tcp_restore_pkt_cur_dir cur_dir;
     struct tcp_restore_info_endpoint client;
     struct tcp_restore_info_endpoint server;
 
@@ -51,9 +59,8 @@ struct tcp_restore_info_tlv
 {
     uint16_t type;
     uint16_t length;
-	
-    union
-    {
+
+    union {
         uint8_t value_as_uint8[0];
         uint16_t value_as_uint16[0];
         uint32_t value_as_uint32[0];
@@ -69,9 +76,9 @@ struct tcp_restore_info_header
     struct tcp_restore_info_tlv tlvs[0];
 } __attribute__((packed));
 
-#define TCP_RESTORE_TCPOPT_KIND      88
-#define TCP_RESTORE_TCPOPT_LENGTH    4
+#define TCP_RESTORE_TCPOPT_KIND 88
+#define TCP_RESTORE_TCPOPT_LENGTH 4
 
-void tcp_restore_info_dump_to_log(const struct tcp_restore_info * info);
-int tcp_restore_info_parse_from_skb(struct sk_buff * skb, struct tcp_restore_info * out);
-int tcp_restore_info_parse_from_cmsg(const char * data, unsigned int datalen, struct tcp_restore_info * out);
+void tcp_restore_info_dump_to_log(const struct tcp_restore_info *info);
+int tcp_restore_info_parse_from_skb(struct sk_buff *skb, struct tcp_restore_info *out);
+int tcp_restore_info_parse_from_cmsg(const char *data, unsigned int datalen, struct tcp_restore_info *out);

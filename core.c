@@ -603,15 +603,15 @@ int tfe_kernel_tcp_queue_outfn(struct nf_queue_entry *entry, unsigned int queuen
     restore_info->instance = g_tfe_kmod_instance;
     restore_info->nf_queue_entry = entry;
 
-    /* Construct restore info from packet */
-    result = tcp_restore_info_parse_from_skb(skb, restore_info);
+    /* ClientHello with leader */
+    result = tcp_restore_info_parse_from_cmsg(cmsg_payload, cmsg_payload_len, restore_info);
     if (unlikely(result < 0))
     {
         goto errout;
     }
 
-    /* ClientHello with leader */
-    result = tcp_restore_info_parse_from_cmsg(cmsg_payload, cmsg_payload_len, restore_info);
+    /* Construct restore info from packet */
+    result = tcp_restore_info_parse_from_skb(skb, restore_info);
     if (unlikely(result < 0))
     {
         goto errout;
