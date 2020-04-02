@@ -83,7 +83,7 @@ int tcp_restore_info_parse_from_skb(struct sk_buff *skb, struct tcp_restore_info
         struct sockaddr_in *in_addr_client;
         struct sockaddr_in *in_addr_server;
 
-        if (out->cur_dir == PKT_CUR_DIR_C2S)
+        if (out->cur_dir == PKT_CUR_DIR_NOT_SET || out->cur_dir == PKT_CUR_DIR_C2S)
         {
             in_addr_client = (struct sockaddr_in *)&out->client.addr;
             in_addr_server = (struct sockaddr_in *)&out->server.addr;
@@ -113,7 +113,7 @@ int tcp_restore_info_parse_from_skb(struct sk_buff *skb, struct tcp_restore_info
         struct sockaddr_in6 *in6_addr_client;
         struct sockaddr_in6 *in6_addr_server;
 
-        if (out->cur_dir == PKT_CUR_DIR_C2S)
+        if (out->cur_dir == PKT_CUR_DIR_NOT_SET || out->cur_dir == PKT_CUR_DIR_C2S)
         {
             in6_addr_client = (struct sockaddr_in6 *)&out->client.addr;
             in6_addr_server = (struct sockaddr_in6 *)&out->server.addr;

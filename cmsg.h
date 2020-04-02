@@ -24,6 +24,7 @@ enum tcp_restore_info_tlv_type
 
 enum tcp_restore_pkt_cur_dir
 {
+    PKT_CUR_DIR_NOT_SET = 0x0,
     PKT_CUR_DIR_C2S = 0x1,
     PKT_CUR_DIR_S2C = 0x2
 };
